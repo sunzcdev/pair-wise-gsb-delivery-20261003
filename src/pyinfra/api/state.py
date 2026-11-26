@@ -287,6 +287,17 @@ class State:
             host: StateHostResults() for host in inventory
         }
 
+        # Facts whose value could not be determined during the prepare phase
+        # (eg the probe was denied permission to read the resource), mapping
+        # host -> {fact key: reason}. Distinct from a fact that confirmed a
+        # resource's absence: unknown values must never be treated as data.
+        self.fact_unknowns: dict[Host, dict[str, str]] = {}
+
+        # Operations that consumed an unknown fact value and so could not be
+        # planned, mapping host -> {op hash: [reasons]}. Other hosts, and
+        # operations that do not depend on unknown values, plan as normal.
+        self.unplanned_ops: dict[Host, dict[str, list[str]]] = {}
+
         # Assign state back references to inventory & config
         inventory.state = config.state = self
         for host in inventory:
@@ -391,6 +402,50 @@ class State:
         op_hash: str,
     ) -> StateOperationHostData:
         return self.ops[host][op_hash]
+
+    def record_fact_unknown(self, host: Host, fact_key: str, reason: str) -> None:
+        """
+        Record that a fact's value is unknown on a host - the probe could not
+        conclude (eg permission denied) - along with the reason, so plan
+        reports can distinguish it from a confirmed value.
+        """
+        self.fact_unknowns.setdefault(host, {})[fact_key] = reason
+
+    def clear_fact_unknown(self, host: Host, fact_key: str) -> None:
+        """
+        Clear any unknown record for a fact, eg after the fact was loaded
+        successfully. A previously unknown value must never linger on to
+        masquerade as a confirmed one.
+        """
+        self.fact_unknowns.get(host, {}).pop(fact_key, None)
+
+    def get_fact_unknowns(self, host: Host) -> dict[str, str]:
+        """
+        Get the unknown fact records for a host, as ``{fact key: reason}``.
+        """
+        return self.fact_unknowns.get(host, {})
+
+    def mark_op_unplanned(self, host: Host, op_hash: str, reason: str) -> None:
+        """
+        Mark an operation as unplanned on a host because it consumed an unknown
+        fact value. The reason is retained for the plan report.
+        """
+        reasons = self.unplanned_ops.setdefault(host, {}).setdefault(op_hash, [])
+        if reason not in reasons:
+            reasons.append(reason)
+
+    def get_unplanned_op_reasons(self, host: Host, op_hash: str) -> list[str]:
+        """
+        Get the reasons an operation is unplanned on a host (empty if planned).
+        """
+        return self.unplanned_ops.get(host, {}).get(op_hash, [])
+
+    def is_op_unplanned(self, host: Host, op_hash: str) -> bool:
+        """
+        Whether an operation could not be planned on a host due to unknown
+        fact values.
+        """
+        return bool(self.get_unplanned_op_reasons(host, op_hash))
 
     def set_op_data_for_host(
         self,

@@ -154,6 +154,17 @@ def _make_command(command_attribute, host_args):
     return command_attribute
 
 
+def _record_fact_unknown(state: State, host: Host, fact_key: str, reason: str) -> None:
+    """
+    Record a fact value as unknown (the probe could not conclude) so plan
+    reports can distinguish it from a confirmed value, and mark any operation
+    currently being planned - ie executing its change detection - as unplanned.
+    """
+    state.record_fact_unknown(host, fact_key, reason)
+    if host.current_op_hash is not None:
+        state.mark_op_unplanned(host, host.current_op_hash, f"{fact_key}: {reason}")
+
+
 def _handle_fact_kwargs(state: State, host: Host, cls, args, kwargs):
     args = args or []
     kwargs = kwargs or {}
@@ -281,6 +292,7 @@ def _get_fact(
     fact_kwargs, global_kwargs = _handle_fact_kwargs(state, host, cls, args, kwargs)
 
     kwargs_str = get_kwargs_str(fact_kwargs)
+    fact_key = f"{name}({kwargs_str})" if kwargs_str else name
     logger.debug(
         "Getting fact: %s (%s) (ensure_hosts: %r)",
         name,
@@ -303,6 +315,11 @@ def _get_fact(
     # drops it the same way before calling `command`.
     precondition_kwargs = {key: value for key, value in fact_kwargs.items() if key != "self"}
     if reason := fact.check_preconditions(state, host, **precondition_kwargs):
+        if not state.is_executing:
+            # The precondition may simply not be satisfied *yet* (a previous
+            # operation will satisfy it): the compat default is returned below,
+            # but retain the unknown reason for the plan report.
+            _record_fact_unknown(state, host, fact_key, f"precondition not satisfied: {reason}")
         raise FactPreconditionError(cls, reason)
 
     command = _make_command(fact.command, fact_kwargs)
@@ -368,6 +385,11 @@ def _get_fact(
             host.print_prefix,
             cmd_str,
         )
+        if not state.is_executing:
+            # Same compat case as preconditions: the binary may be installed by
+            # a previous operation, so retain the unknown reason for the plan
+            # report rather than treating the default as a confirmed value.
+            _record_fact_unknown(state, host, fact_key, f"command not found: {cmd_str}")
         raise MissingCommandError(cmd_str)
 
     data = fact.default()
@@ -402,6 +424,10 @@ def _get_fact(
             status = True
 
     if status:
+        # The probe concluded - any previous unknown record for this fact is
+        # stale and must not linger on to masquerade as the (now known) value.
+        state.clear_fact_unknown(host, fact_key)
+
         log_message = "{}{}".format(
             host.print_prefix,
             f"Loaded fact {format_text(name, bold=True)}{f' ({get_kwargs_str(kwargs)})' if kwargs else ''}",
@@ -419,6 +445,16 @@ def _get_fact(
             global_kwargs["_ignore_errors"],
             description=(f"could not load fact: {name} {get_kwargs_str(fact_kwargs)}"),
         )
+
+        if not state.is_executing and host.current_op_hash is not None:
+            # Inside operation change detection a failed probe (eg permission
+            # denied) means the value is *unknown*, not confirmed absent:
+            # record the reason so the operation is reported as unplanned, and
+            # leave the host active so unrelated operations - on this host and
+            # others - still produce a plan.
+            reason = output.stderr.strip() or "fact command failed"
+            _record_fact_unknown(state, host, fact_key, reason)
+            return data
 
     # Check we've not failed
     if apply_failed_hosts and not status and not global_kwargs["_ignore_errors"]:

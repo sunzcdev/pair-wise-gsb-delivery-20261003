@@ -63,6 +63,10 @@ A deploy runs in two phases. First a **prepare** phase: pyinfra runs your Python
 
 A consequence worth knowing: **deploy code runs before any changes are made on the targets.** If your Python branches on a fact like `host.get_fact(File, "/etc/nginx/conf")` or on `another_op.changed`, that branch is evaluated *during prepare* using the host's state *before any operation in this deploy has run*. For conditions that need to reflect the effect of an earlier operation, use the `_if` argument instead (see [Change Detection](#change-detection) below) — `_if` is evaluated at execute time. The [Deploy Process](deploy-process.md) page walks through this with worked examples.
 
+### Unknown fact values in the plan
+
+A probe that cannot conclude during prepare — for example a fact command denied permission to read a resource — is *not* the same as a probe that confirmed the resource's absence. When a fact's value is unknown, operations that depend on it are reported as **unplanned** in the change detection output (the `Unplanned` column, and `hosts_unplanned`/`unplanned_reasons` in the `--dry --json` plan, alongside a `fact_unknowns` section giving the reason per host). The host is *not* failed: other hosts, and operations that don't depend on the unknown value, still produce a plan. Facts that merely lack a precondition during prepare (a binary a previous operation will install, a module not yet loaded) keep their compatible default value, but the unknown reason is retained for the report. Unknown values are never cached — once the probe can conclude, the next fetch replaces the record with the real value.
+
 ## Global Arguments
 
 Global arguments are covered in detail here: [Global Arguments](arguments.md). There is a set of arguments available to all operations to control authentication (`_sudo`, etc) and operation execution (`_shell_executable`, etc):

@@ -164,8 +164,18 @@ def build_plan_json(state: State) -> list[dict]:
     for op_hash in state.get_op_order():
         hosts_in_op: list[str] = []
         hosts_maybe_in_op: list[str] = []
+        hosts_unplanned: list[str] = []
+        unplanned_reasons: dict[str, list[str]] = {}
         for host in state.inventory.iter_activated_hosts():
             if op_hash not in state.ops[host]:
+                continue
+            reasons = state.get_unplanned_op_reasons(host, op_hash)
+            if reasons:
+                # The operation consumed an unknown fact value on this host, so
+                # no plan could be made - report it separately from hosts with
+                # a confirmed change or a confirmed no-change.
+                hosts_unplanned.append(host.name)
+                unplanned_reasons[host.name] = sorted(reasons)
                 continue
             op_data = state.get_op_data_for_host(host, op_hash)
             if not op_data.operation_meta._maybe_is_change:
@@ -184,9 +194,24 @@ def build_plan_json(state: State) -> list[dict]:
                 "args": list(meta.args),
                 "hosts_with_change": sorted(hosts_in_op),
                 "hosts_with_conditional_change": sorted(hosts_maybe_in_op),
+                "hosts_unplanned": sorted(hosts_unplanned),
+                "unplanned_reasons": unplanned_reasons,
             }
         )
     return operations
+
+
+def build_fact_unknowns_json(state: State) -> dict[str, dict[str, str]]:
+    """
+    Serialise the unknown fact records (host -> {fact: reason}) for the plan
+    report, so callers can see *why* a value could not be determined.
+    """
+    unknowns: dict[str, dict[str, str]] = {}
+    for host in state.inventory.iter_activated_hosts():
+        host_unknowns = state.get_fact_unknowns(host)
+        if host_unknowns:
+            unknowns[host.name] = dict(sorted(host_unknowns.items()))
+    return unknowns
 
 
 def build_results_json(state: State) -> dict:
@@ -241,6 +266,9 @@ def build_results_json(state: State) -> dict:
 
 def print_run_json(state: State, dry: bool) -> None:
     payload: dict = {"plan": build_plan_json(state)}
+    fact_unknowns = build_fact_unknowns_json(state)
+    if fact_unknowns:
+        payload["fact_unknowns"] = fact_unknowns
     if dry:
         payload["results"] = None
     else:
@@ -478,20 +506,25 @@ def pretty_op_name(op_meta):
 
 def print_meta(state: State):
     rows: list[tuple[Callable, list[str] | str]] = [
-        (logger.info, ["Operation", "Change", "Conditional Change"]),
+        (logger.info, ["Operation", "Change", "Conditional Change", "Unplanned"]),
     ]
 
     for op_hash in state.get_op_order():
         hosts_in_op = []
         hosts_maybe_in_op = []
+        hosts_unplanned = []
         for host in state.inventory.iter_activated_hosts():
-            if op_hash in state.ops[host]:
-                op_data = state.get_op_data_for_host(host, op_hash)
-                if op_data.operation_meta._maybe_is_change:
-                    if op_data.global_arguments["_if"]:
-                        hosts_maybe_in_op.append(host.name)
-                    else:
-                        hosts_in_op.append(host.name)
+            if op_hash not in state.ops[host]:
+                continue
+            if state.is_op_unplanned(host, op_hash):
+                hosts_unplanned.append(host.name)
+                continue
+            op_data = state.get_op_data_for_host(host, op_hash)
+            if op_data.operation_meta._maybe_is_change:
+                if op_data.global_arguments["_if"]:
+                    hosts_maybe_in_op.append(host.name)
+                else:
+                    hosts_in_op.append(host.name)
 
         rows.append(
             (
@@ -507,6 +540,11 @@ def print_meta(state: State):
                         "-"
                         if len(hosts_maybe_in_op) == 0
                         else f"{len(hosts_maybe_in_op)} ({truncate(', '.join(sorted(hosts_maybe_in_op)), 48)})"
+                    ),
+                    (
+                        "-"
+                        if len(hosts_unplanned) == 0
+                        else f"{len(hosts_unplanned)} ({truncate(', '.join(sorted(hosts_unplanned)), 48)})"
                     ),
                 ],
             )
