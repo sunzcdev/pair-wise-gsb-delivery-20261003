@@ -182,6 +182,23 @@ async def test_add_one():
     # have been completed and do all the assertions.
 ```
 
+### Bounded execution in tests
+
+`InMemoryBroker` normally starts every task immediately. If you want to check
+that your code behaves under a real concurrency limit, create the broker with
+`bounded_execution=True` and a capacity:
+
+```python
+broker = InMemoryBroker(max_async_tasks=1, bounded_execution=True)
+```
+
+Ordinary submissions then wait for a free execution opportunity. A task that is
+already running can lend its opportunity to a nested task with
+`await child.kiq_borrowed(...)`, which executes the child inline and prevents a
+single-slot deadlock. Dependencies and results stay separate for parent and
+child. A plain `kiq()` from task code still queues behind the limit, even though
+it inherits the task's context.
+
 ## Dependency injection
 
 If you use dependencies in your tasks, you may think that this can become a problem for tests. But it's not.

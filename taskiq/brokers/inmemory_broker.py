@@ -10,6 +10,11 @@ from taskiq.abc.result_backend import AsyncResultBackend, TaskiqResult
 from taskiq.depends.progress_tracker import TaskProgress
 from taskiq.events import TaskiqEvents
 from taskiq.exceptions import UnknownTaskError
+from taskiq.execution import (
+    ExecutionSlot,
+    current_borrow_request,
+    current_execution_slot,
+)
 from taskiq.message import BrokerMessage
 from taskiq.receiver import Receiver
 from taskiq.utils import maybe_awaitable
@@ -120,6 +125,18 @@ class InMemoryBroker(AsyncBroker):
     This broker is used to execute tasks without sending them elsewhere.
 
     It's useful for local development, if you don't want to setup real broker.
+
+    By default every task is started as soon as it is sent, so
+    ``max_async_tasks`` has no visible effect. Passing
+    ``bounded_execution=True`` makes the broker honour that limit: ordinary
+    background submissions queue until an execution opportunity is free.
+
+    A task that is already running may explicitly lend its opportunity to a
+    nested task sent to the same broker. Such a nested task is executed in the
+    caller's context instead of waiting for free capacity, which avoids a
+    single-slot deadlock. Asking for the loan is always explicit, so inherited
+    task context never lets an ordinary background submission bypass the
+    limit.
     """
 
     def __init__(
@@ -131,6 +148,7 @@ class InMemoryBroker(AsyncBroker):
         max_async_tasks_jitter: int = 0,
         propagate_exceptions: bool = True,
         await_inplace: bool = False,
+        bounded_execution: bool = False,
     ) -> None:
         super().__init__()
         self.result_backend: InmemoryResultBackend[Any] = InmemoryResultBackend(
@@ -145,8 +163,20 @@ class InMemoryBroker(AsyncBroker):
             max_async_tasks_jitter=max_async_tasks_jitter,
             propagate_exceptions=propagate_exceptions,
         )
+        if bounded_execution and self.receiver.sem is None:
+            raise ValueError(
+                "bounded_execution requires a positive max_async_tasks value.",
+            )
         self.await_inplace = await_inplace
+        self.bounded_execution = bounded_execution
         self._running_tasks: set[asyncio.Task[Any]] = set()
+
+    @property
+    def _execution_capacity(self) -> asyncio.Semaphore | None:
+        """Semaphore that bounds concurrent executions, when enabled."""
+        if not self.bounded_execution:
+            return None
+        return self.receiver.sem
 
     async def kick(self, message: BrokerMessage) -> None:
         """
@@ -162,14 +192,53 @@ class InMemoryBroker(AsyncBroker):
         if target_task is None:
             raise UnknownTaskError(task_name=message.task_name)
 
-        receiver_cb = self.receiver.callback(message=message.message)
-        if self.await_inplace:
-            await receiver_cb
-            return
+        # Borrowing only applies to this single send. Consume the request so
+        # that nested sends performed by the task itself always go through the
+        # normal capacity-bound path.
+        borrow_requested = current_borrow_request.get()
+        borrow_token = current_borrow_request.set(False)
+        try:
+            if self.await_inplace:
+                await self._run_callback(message.message)
+                return
 
-        task = asyncio.create_task(receiver_cb)
+            if (
+                borrow_requested
+                and self.bounded_execution
+                and self._can_borrow_execution()
+            ):
+                await self._run_callback(message.message)
+                return
+        finally:
+            current_borrow_request.reset(borrow_token)
+
+        task = asyncio.create_task(self._schedule_callback(message.message))
         self._running_tasks.add(task)
         task.add_done_callback(self._running_tasks.discard)
+
+    def _can_borrow_execution(self) -> bool:
+        """Check whether the current task may lend its execution opportunity."""
+        slot = current_execution_slot.get()
+        return slot is not None and slot.can_be_borrowed_by(self)
+
+    async def _schedule_callback(self, message: bytes) -> None:
+        """Run a callback, waiting for capacity when the broker is bounded."""
+        semaphore = self._execution_capacity
+        if semaphore is None:
+            await self._run_callback(message)
+            return
+        async with semaphore:
+            await self._run_callback(message)
+
+    async def _run_callback(self, message: bytes) -> None:
+        """Execute one callback and publish its own execution opportunity."""
+        slot = ExecutionSlot(self)
+        token = current_execution_slot.set(slot)
+        try:
+            await self.receiver.callback(message=message)
+        finally:
+            slot.mark_released()
+            current_execution_slot.reset(token)
 
     def listen(self) -> AsyncGenerator[bytes, None]:
         """

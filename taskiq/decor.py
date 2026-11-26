@@ -136,6 +136,53 @@ class AsyncTaskiqDecoratedTask(Generic[_FuncParams, _ReturnType]):
         """
         return await self.kicker().kiq(*args, **kwargs)
 
+    @overload
+    async def kiq_borrowed(
+        self: "AsyncTaskiqDecoratedTask[_FuncParams, CoroutineType[Any, Any, _T]]",
+        *args: _FuncParams.args,
+        **kwargs: _FuncParams.kwargs,
+    ) -> AsyncTaskiqTask[_T]: ...
+
+    @overload
+    async def kiq_borrowed(
+        self: "AsyncTaskiqDecoratedTask[_FuncParams, Coroutine[Any, Any, _T]]",
+        *args: _FuncParams.args,
+        **kwargs: _FuncParams.kwargs,
+    ) -> AsyncTaskiqTask[_T]: ...
+
+    @overload
+    async def kiq_borrowed(
+        self: "AsyncTaskiqDecoratedTask[_FuncParams, _ReturnType]",
+        *args: _FuncParams.args,
+        **kwargs: _FuncParams.kwargs,
+    ) -> AsyncTaskiqTask[_ReturnType]: ...
+
+    async def kiq_borrowed(
+        self,
+        *args: _FuncParams.args,
+        **kwargs: _FuncParams.kwargs,
+    ) -> Any:
+        """
+        Send a nested task that reuses the caller's execution opportunity.
+
+        In-process brokers can bound how many tasks run at once. A running
+        task that holds such an opportunity can hand it to this send, so the
+        nested task executes right here instead of waiting for a free slot.
+        Without the hand-off, a single-slot broker would deadlock while the
+        parent waits for its own child.
+
+        The request is per-send and only has effect when the caller actually
+        owns an execution opportunity of the same broker. Calling this outside
+        of a task, or for another broker, behaves like an ordinary ``kiq``
+        submission and still respects capacity.
+
+        :param args: function's arguments.
+        :param kwargs: function's key word arguments.
+        :returns: taskiq task. When the caller's slot was borrowed, the task
+            has already finished and its result is ready.
+        """
+        return await self.kicker().with_borrowed_slot().kiq(*args, **kwargs)
+
     async def schedule_by_cron(
         self,
         source: "ScheduleSource",

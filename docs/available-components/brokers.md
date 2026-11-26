@@ -12,6 +12,52 @@ This is a special broker for local development. It uses the same functions to ex
 but all tasks are executed locally in the current thread.
 By default it uses `InMemoryResultBackend` but this can be overridden.
 
+### Bounded execution
+
+By default `InMemoryBroker` starts every task immediately, so `max_async_tasks`
+doesn't limit anything. Pass `bounded_execution=True` to make the broker honour
+that limit. Ordinary submissions then queue until an execution opportunity is
+free:
+
+```python
+from taskiq import InMemoryBroker
+
+broker = InMemoryBroker(max_async_tasks=1, bounded_execution=True)
+```
+
+A running task that already occupies an execution opportunity can hand it to a
+nested task sent to the same broker. Without the hand-off a single-slot broker
+would deadlock: the parent waits for its child, but the child waits for the
+capacity the parent holds. Borrowing is always explicit:
+
+```python
+@broker.task
+async def parent() -> int:
+    # Runs inline, using the parent's execution opportunity.
+    child = await compute.kiq_borrowed(41)
+    result = await child.wait_result()
+    return result.return_value + 1
+```
+
+The hand-off covers exactly one send, and only when the caller really owns an
+opportunity of the same broker. An ordinary `kiq()` started from task code still
+queues behind the available capacity, even though it inherits the task's
+context. Each task keeps its own dependencies and its own stored result, so
+parent and child are settled independently.
+
+Borrowing can also be requested from a kicker, for example when the task object
+is not available:
+
+```python
+from taskiq import AsyncKicker
+
+kicker = AsyncKicker("module:compute", broker, {})
+handle = await kicker.with_borrowed_slot().kiq(1)
+```
+
+`await_inplace=True` keeps working as before and is independent of
+`bounded_execution`.
+
 ## ZeroMQBroker
 
 This broker uses [ZMQ](https://zeromq.org/) to communicate between worker and client processes.

@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.exceptions import SendTaskError
+from taskiq.execution import current_borrow_request
 from taskiq.labels import prepare_label
 from taskiq.message import TaskiqMessage
 from taskiq.scheduler.created_schedule import CreatedSchedule
@@ -51,6 +52,29 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
         self.custom_task_id: str | None = None
         self.custom_schedule_id: str | None = None
         self.return_type = return_type
+        self.borrow_execution_slot = False
+
+    def with_borrowed_slot(
+        self,
+        borrow: bool = True,
+    ) -> "AsyncKicker[_FuncParams, _ReturnType]":
+        """
+        Let this send reuse the caller's execution opportunity.
+
+        In-process brokers can bound how many tasks execute at once. A running
+        task that holds one of those opportunities may explicitly lend it to
+        the task sent through this kicker. The nested task then executes inside
+        the caller instead of waiting for free capacity.
+
+        The request only lasts for this single send. It is ignored when the
+        caller does not hold an opportunity of the same broker, so it cannot be
+        used to bypass capacity from an ordinary submission.
+
+        :param borrow: whether the nested task may use the caller's slot.
+        :return: kicker with the borrow request.
+        """
+        self.borrow_execution_slot = borrow
+        return self
 
     def with_labels(
         self,
@@ -162,10 +186,13 @@ class AsyncKicker(Generic[_FuncParams, _ReturnType]):
         for middleware in self.broker.middlewares:
             if middleware.__class__.pre_send != TaskiqMiddleware.pre_send:
                 message = await maybe_awaitable(middleware.pre_send(message))
+        borrow_token = current_borrow_request.set(self.borrow_execution_slot)
         try:
             await self.broker.kick(self.broker.formatter.dumps(message))
         except Exception as exc:
             raise SendTaskError from exc
+        finally:
+            current_borrow_request.reset(borrow_token)
 
         for middleware in reversed(self.broker.middlewares):
             if middleware.__class__.post_send != TaskiqMiddleware.post_send:
