@@ -8,6 +8,7 @@
 # Copyright, 2026, by Kyle Tate.
 
 require_relative "clock"
+require_relative "deadline"
 require_relative "task"
 require_relative "timeout"
 require_relative "fork_handler"
@@ -75,20 +76,27 @@ module Async
 		# @public Since *Async v1*.
 		# @parameter parent [Node | Nil] The parent node to use for task hierarchy.
 		# @parameter selector [IO::Event::Selector] The selector to use for event handling.
-		def initialize(parent = nil, selector: nil, profiler: Profiler&.default, worker_pool: WORKER_POOL)
+		# @parameter clock [Module] The clock used to measure time, primarily intended for testing with a controllable clock.
+		def initialize(parent = nil, selector: nil, profiler: Profiler&.default, worker_pool: WORKER_POOL, clock: Clock)
 			super(parent)
-			
+
 			@selector = selector || ::IO::Event::Selector.new(Fiber.current)
 			@profiler = profiler
-			
+
 			@interrupted = false
-			
+
 			@blocked = 0
-			
+
+			# The clock shared by timers and deadlines, so nested timeouts and their effective deadlines always use the same time space:
+			@clock = clock
+
+			# Fallback timeout stacks for blocking fibers that don't support fiber storage, keyed by fiber identity:
+			@timeout_stacks = Hash.new {|hash, fiber| hash[fiber] = []}
+
 			@busy_time = 0.0
 			@idle_time = 0.0
-			
-			@timers = ::IO::Event::Timers.new
+
+			@timers = Timers.new(clock)
 			
 			if worker_pool == true
 				@worker_pool = WorkerPool&.new
@@ -649,7 +657,39 @@ module Async
 			return async(...).fiber
 		end
 		
+		# The fiber-local key under which the active {Timeout} stack is stored on fibers that support fiber storage.
+		TIMEOUT_STORAGE = :async_timeouts
+
+		# Look up the stack of active timeouts for the given fiber.
+		#
+		# The outermost timeout is at the bottom of the stack and the innermost at the top. Each fiber only ever sees its own timeouts, so concurrent tasks cannot interfere with each other.
+		#
+		# @parameter fiber [Fiber] The fiber to inspect, defaults to the current fiber.
+		# @returns [Array<Timeout>] The stack of active timeouts, outermost first.
+		def self.timeouts(fiber = Fiber.current)
+			if fiber.respond_to?(:[])
+				fiber[TIMEOUT_STORAGE] ||= []
+			elsif scheduler = Fiber.scheduler
+				# Blocking (root) fibers don't support fiber storage on some Ruby versions, so fall back to a scheduler-local map keyed by fiber identity:
+				scheduler.send(:timeout_stack, fiber)
+			else
+				# No scheduler means no timeout can be active:
+				[]
+			end
+		end
+
+		# The effective timeout constraining the given fiber, i.e. the innermost
+		# active timeout. Returns nil when the fiber has no active timeout.
+		#
+		# @parameter fiber [Fiber] The fiber to inspect, defaults to the current fiber.
+		# @returns [Timeout | Nil] The innermost active timeout, if any.
+		def self.current_timeout(fiber = Fiber.current)
+			self.timeouts(fiber).last
+		end
+
 		# Invoke the block, but after the specified timeout, raise {TimeoutError} in any currenly blocking operation. If the block runs to completion before the timeout occurs or there are no non-blocking operations after the timeout expires, the code will complete without any exception.
+		#
+		# Nested invocations are supported: each layer gets its own {Timeout}, and the effective deadline of an inner timeout is the earlier of its own fire time and the enclosing timeout's effective deadline. When the inner block exits early (either normally or via a rescued timeout), its timer is cancelled without touching the outer deadline.
 		#
 		# @public Since *Async v1*.
 		# @asynchronous May raise an exception at any interruption point (e.g. blocking operations).
@@ -660,20 +700,54 @@ module Async
 		# @yields {|timeout| ...} The block to execute with a timeout.
 		def with_timeout(duration, exception = TimeoutError, message = "execution expired", &block)
 			fiber = Fiber.current
-			
+			stack = Scheduler.timeouts(fiber)
+
+			# Track the deadline using the same clock as the timers, so the effective deadline remains readable even while blocking and uses the same time space as the timer:
+			deadline = Deadline.start(duration, clock: @clock)
+
+			parent = stack.last
+
+			# The timeout instance is assigned below, but the timer block needs a reference to it. A rescheduled timeout replaces its internal handle, so matching against the captured handle would fail after `#adjust`/`#time=`; the timeout object itself stays stable:
+			timeout = nil
+
 			timer = @timers.after(duration) do
 				if fiber.alive?
-					fiber.raise(exception, message)
+					# Resolve the timeout instance that actually fired from the fiber's stack, so the raised exception identifies the layer which ended the task:
+					fired = stack.include?(timeout) ? timeout : stack.last
+
+					error = begin
+						exception.new(message)
+					rescue ArgumentError
+						# Tolerate exception classes whose initializer takes no arguments:
+						exception.new
+					end
+
+					# Attach the firing timeout when the exception supports it, so custom exception classes keep working unchanged:
+					error.timeout = fired if error.is_a?(TimeoutError)
+					fiber.raise(error)
 				end
 			end
-			
-			if block.arity.zero?
-				yield
-			else
-				yield Timeout.new(@timers, timer)
+
+			timeout = Timeout.new(@timers, timer, deadline: deadline, parent: parent)
+			stack.push(timeout)
+
+			begin
+				if block.arity.zero?
+					yield
+				else
+					yield timeout
+				end
+			ensure
+				# Remove this layer from the stack and cancel only its own timer. The enclosing timeout's timer and deadline are left untouched, so an early exit from an inner operation starts the next segment under the outer deadline:
+				stack.delete(timeout)
+				@timeout_stacks.delete(fiber) if !fiber.respond_to?(:[]) && stack.empty?
+				timer&.cancel!
 			end
-		ensure
-			timer&.cancel!
+		end
+
+		# Look up (or create) the fallback timeout stack for a fiber that doesn't support fiber storage.
+		private def timeout_stack(fiber)
+			@timeout_stacks[fiber]
 		end
 		
 		# Invoke the block, but after the specified timeout, raise the specified exception with the given message. If the block runs to completion before the timeout occurs or there are no non-blocking operations after the timeout expires, the code will complete without any exception.
@@ -701,8 +775,9 @@ module Async
 			@children = nil
 			@selector = nil
 			@timers = nil
+			@timeout_stacks = nil
 			@blocked = 0
-			
+
 			# Close the scheduler:
 			Fiber.set_scheduler(nil)
 		end

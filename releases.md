@@ -1,5 +1,12 @@
 # Releases
 
+## Unreleased
+
+  - Nested `Scheduler#with_timeout` calls now maintain a per-fiber stack of `Async::Timeout` instances. Each layer exposes a readable `#deadline`, its enclosing `#parent`, and an `#effective_time`/`#effective?`/`#constrained?` view that identifies which layer will actually end the task. When an inner block exits early, only its own timer is cancelled, leaving the outer deadline in effect for the next segment.
+  - `Async::TimeoutError` now carries the `Async::Timeout` that fired via `#timeout`, while ordinary business exceptions raised inside a timeout block remain unchanged.
+  - `Async::Deadline` gains `#time`, `#duration`, `#clock`, an injectable clock, and matching helpers on `Deadline::Zero`.
+  - `Scheduler` and `Async::Timers` accept an injectable clock, and `Async::FakeClock` is provided for deterministic timeout testing.
+
 ## v2.46.0
 
   - Fixed `Thread#kill` raising a `TypeError` while shutting down a thread with an active `Async::Reactor`.

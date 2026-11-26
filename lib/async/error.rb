@@ -10,8 +10,20 @@ module Async
 		# Create a new timeout error.
 		#
 		# @parameter message [String] The error message.
-		def initialize(message = "execution expired")
-			super
+		# @parameter timeout [Async::Timeout | Nil] The timeout which caused the error, if available.
+		def initialize(message = "execution expired", timeout: nil)
+			super(message)
+
+			@timeout = timeout
 		end
+
+		# The timeout which caused this error.
+		#
+		# When timeouts are nested, this can be used to determine which layer
+		# actually ended the task, and whether an outer deadline is still in
+		# effect via {Async::Timeout#parent}.
+		#
+		# @returns [Async::Timeout | Nil] The timeout which caused the error.
+		attr_accessor :timeout
 	end
 end
