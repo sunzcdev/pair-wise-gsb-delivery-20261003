@@ -20,6 +20,11 @@ from taskiq.abc.broker import AckableMessage, AsyncBroker
 from taskiq.abc.middleware import TaskiqMiddleware
 from taskiq.acks import AckController, AcknowledgeType, parse_acknowledge_type
 from taskiq.context import Context
+from taskiq.depends.shared import (
+    SharedScope,
+    reset_current_scope,
+    set_current_scope,
+)
 from taskiq.exceptions import NoResultError
 from taskiq.message import TaskiqMessage
 from taskiq.receiver.params_parser import parse_params
@@ -289,6 +294,11 @@ class Receiver:
         # because we want to update them with
         # kwargs resolved by dependency injector.
         kwargs = {}
+        # Every processed message gets its own explicit sharing scope.  It is
+        # bound to the current context so concurrently processed messages and
+        # nested dependency resolutions never share handles.
+        message_scope = SharedScope()
+        scope_token: Any = None
         if dependency_graph:
             # Create a context for dependency resolving.
             broker_ctx = self.broker.custom_dependency_context
@@ -298,8 +308,12 @@ class Receiver:
                     TaskiqState: self.broker.state,
                 },
             )
+            # Per message cache: keep the user/broker context but expose the
+            # message scoped SharedScope for type annotated injection.
+            dependency_initial_cache = dict(broker_ctx)
+            dependency_initial_cache[SharedScope] = message_scope
             dep_ctx = dependency_graph.async_ctx(
-                broker_ctx,
+                dependency_initial_cache,
                 self.broker.dependency_overrides or None,
             )
             # Resolve all function's dependencies.
@@ -313,6 +327,7 @@ class Receiver:
             else inspect.iscoroutinefunction
         )
         try:
+            scope_token = set_current_scope(message_scope)
             # We put kwargs resolving here,
             # to be able to catch any exception (for example ),
             # that happen while resolving dependencies.
@@ -376,15 +391,24 @@ class Receiver:
             logger.exception("Exception found while executing function.")
         # Stop the timer.
         execution_time = time() - start_time
-        if dep_ctx:
-            args = (None, None, None)
-            if found_exception and self.propagate_exceptions:
-                args = (  # type: ignore
-                    type(found_exception),
-                    found_exception,
-                    found_exception.__traceback__,
-                )
-            await dep_ctx.close(*args)
+        teardown_args: tuple[Any, Any, Any] = (None, None, None)
+        teardown_exc: BaseException | None = None
+        if found_exception and self.propagate_exceptions:
+            teardown_exc = found_exception
+            teardown_args = (  # type: ignore
+                type(found_exception),
+                found_exception,
+                found_exception.__traceback__,
+            )
+        try:
+            if dep_ctx:
+                await dep_ctx.close(*teardown_args)
+        finally:
+            # Shared resources are released last (after branch generators),
+            # in the reverse order of their actual entry.
+            await message_scope.aclose(teardown_exc)
+            if scope_token is not None:
+                reset_current_scope(scope_token)
 
         # Assemble result.
         result: TaskiqResult[Any] = TaskiqResult(

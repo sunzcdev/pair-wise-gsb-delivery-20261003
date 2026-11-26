@@ -2,8 +2,24 @@
 
 from importlib.metadata import version
 
-from taskiq_dependencies import Depends as TaskiqDepends
+from taskiq_dependencies import Depends
 
+from taskiq.depends.shared import (
+    MessageScope,
+    RequestScope,
+    Share,
+    Shared,
+    SharedDependency,
+    SharedDepends,
+    SharedScope,
+    TaskiqDepends,
+    TaskiqSharedDepends,
+    current_scope,
+    shared,
+    shared_depends,
+    shared_dependency,
+    shared_scope,
+)
 from taskiq.abc.broker import AsyncBroker, AsyncTaskiqDecoratedTask
 from taskiq.abc.formatter import TaskiqFormatter
 from taskiq.abc.middleware import TaskiqMiddleware
@@ -49,15 +65,23 @@ __all__ = [
     "AsyncTaskiqTask",
     "BrokerMessage",
     "Context",
+    "Depends",
     "InMemoryBroker",
     "MultiBroker",
+    "MessageScope",
     "NoResultError",
     "PrometheusMiddleware",
+    "RequestScope",
     "ResultGetError",
     "ResultIsReadyError",
+    "SecurityError",
+    "Share",
+    "Shared",
+    "SharedDependency",
+    "SharedDepends",
+    "SharedScope",
     "ScheduleSource",
     "ScheduledTask",
-    "SecurityError",
     "SendTaskError",
     "SimpleRetryMiddleware",
     "SmartRetryMiddleware",
@@ -70,9 +94,15 @@ __all__ = [
     "TaskiqResult",
     "TaskiqResultTimeoutError",
     "TaskiqScheduler",
+    "TaskiqSharedDepends",
     "TaskiqState",
     "ZeroMQBroker",
     "__version__",
     "async_shared_broker",
+    "current_scope",
     "gather",
+    "shared",
+    "shared_depends",
+    "shared_dependency",
+    "shared_scope",
 ]
