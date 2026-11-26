@@ -1,6 +1,13 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Per-Publish Results Combining basic.return and Publisher Confirms
+
+`Bunny::Channel#confirm_select` accepts a new `publish_results: true` option. With it,
+`Bunny::Channel#basic_publish` returns a `Bunny::PublishResult` identified by its publish
+sequence number (not by payload, so identical bodies are told apart). The result is updated
+with the publisher confirm and, for mandatory messages that cannot be routed, the
+`basic.return` that explains why. The confirm callback passed to `confirm_select` keeps
+working as before.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)

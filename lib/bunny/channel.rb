@@ -11,6 +11,7 @@ require "bunny/queue"
 
 require "bunny/delivery_info"
 require "bunny/return_info"
+require "bunny/publish_result"
 require "bunny/message_properties"
 
 require "bunny/concurrent/continuation_queue"
@@ -218,6 +219,8 @@ module Bunny
       @outstanding_limit = nil
       @confirm_timeout = nil
       @throttle_publishes = false
+      @publish_results_enabled = false
+      @pending_publish_results = {}
       @per_message_continuations = {}
       @per_message_continuations_mutex = @connection.mutex_impl.new
       @outstanding_limit_cond = nil
@@ -773,7 +776,8 @@ module Bunny
     # @option opts [String] :user_id Optional user ID. Verified by RabbitMQ against the actual connection username
     # @option opts [String] :app_id Optional application ID
     #
-    # @return [Bunny::Channel] Self
+    # @return [Bunny::Channel] Self, or a [Bunny::PublishResult] when publish result
+    #   tracking is enabled (see #confirm_select)
     # @api public
     def basic_publish(payload, exchange, routing_key, opts = {})
       raise_if_no_longer_open!
@@ -793,6 +797,7 @@ module Bunny
 
       seq_no = nil
       continuation = nil
+      publish_result = nil
 
       if @next_publish_seq_no > 0
         @unconfirmed_set_mutex.synchronize do
@@ -802,6 +807,11 @@ module Bunny
           seq_no = @next_publish_seq_no
           @unconfirmed_set.add(seq_no)
           @next_publish_seq_no += 1
+
+          if @publish_results_enabled
+            publish_result = PublishResult.new(seq_no, exchange_name, routing_key)
+            @pending_publish_results[seq_no] = publish_result
+          end
 
           # Only create per-message continuation when blocking individually (no limit)
           if @confirms_tracking_enabled && !@throttle_publishes
@@ -825,7 +835,7 @@ module Bunny
 
       wait_for_publish_confirm(seq_no, continuation) if continuation
 
-      self
+      publish_result || self
     end
 
     # Publishes multiple messages in a batch with a single mutex acquisition.
@@ -1860,6 +1870,9 @@ module Bunny
     # @param [Integer] outstanding_limit Max unconfirmed messages before basic_publish blocks.
     #   Defaults to 1000 when tracking: true (optimal for throughput). Pass explicit value to override.
     # @param [Integer] confirm_timeout Timeout in ms for confirms. Defaults to connection's continuation_timeout.
+    # @param [Boolean] publish_results When true, basic_publish returns a Bunny::PublishResult
+    #   that is updated with the publisher confirm and, for mandatory messages that cannot
+    #   be routed, the basic.return. Results are keyed by publish sequence number.
     #
     # @return [AMQ::Protocol::Confirm::SelectOk] RabbitMQ response
     # @see #wait_for_confirms
@@ -1867,7 +1880,7 @@ module Bunny
     # @see #nacked_set
     # @see http://rubybunny.info/articles/extensions.html RabbitMQ Extensions guide
     # @api public
-    def confirm_select(callback = nil, tracking: false, outstanding_limit: nil, confirm_timeout: nil)
+    def confirm_select(callback = nil, tracking: false, outstanding_limit: nil, confirm_timeout: nil, publish_results: false)
       raise_if_no_longer_open!
       raise ArgumentError, "outstanding_limit requires tracking: true" if outstanding_limit && !tracking
       raise ArgumentError, "outstanding_limit must be positive" if outstanding_limit && outstanding_limit < 1
@@ -1883,6 +1896,7 @@ module Bunny
 
       @confirms_callback = callback
       @confirms_tracking_enabled = tracking
+      @publish_results_enabled = publish_results
       # Default to optimal limit when tracking enabled (avoids per-message mutex)
       @outstanding_limit = outstanding_limit || (tracking ? DEFAULT_OUTSTANDING_CONFIRMS_LIMIT : nil)
       @confirm_timeout = confirm_timeout
@@ -2001,6 +2015,9 @@ module Bunny
         @unconfirmed_set.clear
         @delivery_tag_offset = @next_publish_seq_no - 1
 
+        # confirms for these publishes were lost with the connection
+        @pending_publish_results.clear
+
         if @confirms_tracking_enabled
           @per_message_continuations_mutex.synchronize do
             @per_message_continuations.each_value { |c| c.push(:network_error) }
@@ -2014,7 +2031,8 @@ module Bunny
       confirm_select(@confirms_callback,
                      tracking: @confirms_tracking_enabled,
                      outstanding_limit: @outstanding_limit,
-                     confirm_timeout: @confirm_timeout)
+                     confirm_timeout: @confirm_timeout,
+                     publish_results: @publish_results_enabled)
     end
 
     # Recovers transaction mode. Used by the Automatic Network Failure
@@ -2301,12 +2319,29 @@ module Bunny
 
     # @private
     def handle_basic_return(basic_return, properties, content)
+      record_basic_return(basic_return) if @publish_results_enabled
+
       x = find_exchange(basic_return.exchange)
 
       if x
         x.handle_return(ReturnInfo.new(basic_return), MessageProperties.new(properties), content)
       else
         @logger.warn "Exchange #{basic_return.exchange} is not in channel #{@id}'s cache! Dropping returned message!"
+      end
+    end
+
+    # Correlates a basic.return to the earliest still unconfirmed publish with the
+    # same exchange and routing key. RabbitMQ sends basic.return before the confirm
+    # of the returned message, so a return always finds its publish still pending.
+    # @private
+    def record_basic_return(basic_return)
+      return_info = ReturnInfo.new(basic_return)
+
+      @unconfirmed_set_mutex.synchronize do
+        result = @pending_publish_results.each_value.find do |r|
+          !r.returned? && r.exchange == basic_return.exchange && r.routing_key == basic_return.routing_key
+        end
+        result&.return!(return_info)
       end
     end
 
@@ -2327,6 +2362,17 @@ module Bunny
         @unconfirmed_set.subtract(confirmed_range)
 
         @only_acks_received = (@only_acks_received && !nack)
+
+        # A confirmed publish can no longer be returned (basic.return precedes
+        # its confirm), so its result is complete and can be released
+        unless @pending_publish_results.empty?
+          status = nack ? :nack : :ack
+          @pending_publish_results.keys.each do |tag|
+            if confirmed_range.cover?(tag)
+              @pending_publish_results.delete(tag).confirm!(status)
+            end
+          end
+        end
 
         @confirms_continuations.push(true) if @unconfirmed_set.empty?
 
