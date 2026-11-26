@@ -19,6 +19,7 @@ from typing import Any, TypeAlias, TypeVar, TypeVarTuple, Unpack
 
 from .. import (
     BrokenResourceError,
+    ClosedResourceError,
     EndOfStream,
     aclose_forcefully,
     get_cancelled_exc_class,
@@ -91,6 +92,7 @@ class TLSStream(ByteStream):
     _read_bio: ssl.MemoryBIO
     _write_bio: ssl.MemoryBIO
     _broken: bool = field(default=False, init=False)
+    _half_closed: bool = field(default=False, init=False)
 
     @classmethod
     async def wrap(
@@ -216,6 +218,11 @@ class TLSStream(ByteStream):
                 self._read_bio.write_eof()
                 self._write_bio.write_eof()
                 raise BrokenResourceError from exc
+            except ssl.SSLZeroReturnError:
+                # The peer has sent a close_notify. SSLObject.read() raises
+                # this instead of returning an empty bytes object once a
+                # shutdown has been initiated on this end as well.
+                raise EndOfStream from None
             except ssl.SSLError as exc:
                 self._read_bio.write_eof()
                 self._write_bio.write_eof()
@@ -267,9 +274,34 @@ class TLSStream(ByteStream):
         return data
 
     async def send(self, item: bytes) -> None:
+        if self._half_closed:
+            raise ClosedResourceError
+
         await self._call_sslobject_method(self._ssl_object.write, item)
 
     async def send_eof(self) -> None:
+        """
+        Half-close the sending direction of the stream.
+
+        On a TLS 1.3 connection this sends a single ``close_notify`` alert to
+        the peer without waiting for its reply, leaving the receiving direction
+        open. Application data already queued by the peer, or sent after it has
+        observed the alert, can still be received until the peer closes its own
+        sending direction (at which point :meth:`receive` raises
+        :class:`~anyio.EndOfStream`).
+
+        The method is idempotent: successive calls are no-ops and never send a
+        second ``close_notify``. Once it has succeeded, :meth:`send` raises
+        :class:`~anyio.ClosedResourceError`. A subsequent :meth:`aclose`
+        completes the second half of the closing handshake.
+
+        :raises NotImplementedError: if the negotiated TLS protocol version is
+            older than TLS 1.3
+
+        """
+        if self._half_closed:
+            return
+
         tls_version = self.extra(TLSAttribute.tls_version)
         match = re.match(r"TLSv(\d+)(?:\.(\d+))?", tls_version)
         if match:
@@ -279,10 +311,35 @@ class TLSStream(ByteStream):
                     f"send_eof() requires at least TLSv1.3; current "
                     f"session uses {tls_version}"
                 )
+        else:
+            raise NotImplementedError(
+                "send_eof() has not yet been implemented for TLS streams"
+            )
 
-        raise NotImplementedError(
-            "send_eof() has not yet been implemented for TLS streams"
-        )
+        # Initiate a one-way TLS shutdown: the first shutdown step only queues
+        # a close_notify alert in the write BIO. It must not wait for the
+        # peer's close_notify, so that application data already in flight (and
+        # any data the peer sends afterwards) can still be received. OpenSSL
+        # generates this alert only once, so a later aclose()/unwrap() will
+        # not send a duplicate.
+        while True:
+            try:
+                self._ssl_object.unwrap()
+            except ssl.SSLWantWriteError:
+                await self._flush_write_bio()
+            except ssl.SSLWantReadError:
+                # The close_notify has been queued. The second shutdown step
+                # (waiting for the peer's close_notify) is left for the
+                # receive side and aclose().
+                break
+            else:
+                break
+
+        # Flushing fails only if the transport can no longer deliver the
+        # alert, in which case the stream is broken and must not be treated
+        # as half-closed.
+        await self._flush_write_bio()
+        self._half_closed = True
 
     @property
     def extra_attributes(self) -> Mapping[Any, Callable[[], Any]]:

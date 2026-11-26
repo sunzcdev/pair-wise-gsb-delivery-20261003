@@ -13,8 +13,10 @@ from trustme import CA
 from anyio import (
     BrokenResourceError,
     CancelScope,
+    ClosedResourceError,
     EndOfStream,
     Event,
+    aclose_forcefully,
     connect_tcp,
     create_memory_object_stream,
     create_task_group,
@@ -418,40 +420,197 @@ class TestTLSStream:
         server_thread.join()
         server_sock.close()
 
-    @pytest.mark.parametrize(
-        "force_tlsv12",
-        [
-            pytest.param(
-                False,
-                marks=[
-                    pytest.mark.skipif(
-                        not getattr(ssl, "HAS_TLSv1_3", False),
-                        reason="No TLS 1.3 support",
-                    )
-                ],
-            ),
-            pytest.param(True),
-        ],
-        ids=["tlsv13", "tlsv12"],
-    )
-    async def test_send_eof_not_implemented(
-        self, server_context: ssl.SSLContext, ca: CA, force_tlsv12: bool
+    async def test_send_eof_requires_tls13(
+        self,
+        request: pytest.FixtureRequest,
+        server_context: ssl.SSLContext,
+        ca: CA,
     ) -> None:
         def serve_sync() -> None:
             conn, _addr = server_sock.accept()
-            conn.sendall(b"hello")
-            conn.unwrap()
-            conn.close()
+            try:
+                conn.sendall(b"hello")
+                # The client's aclose() still performs the normal closing
+                # handshake even though send_eof() is unsupported on TLS 1.2
+                conn.unwrap()
+            finally:
+                conn.close()
 
         client_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
         ca.configure_trust(client_context)
-        if force_tlsv12:
-            expected_pattern = r"send_eof\(\) requires at least TLSv1.3"
-            client_context.maximum_version = ssl.TLSVersion.TLSv1_2
-        else:
-            expected_pattern = (
-                r"send_eof\(\) has not yet been implemented for TLS streams"
+        client_context.maximum_version = ssl.TLSVersion.TLSv1_2
+
+        server_sock = server_context.wrap_socket(
+            socket.socket(), server_side=True, suppress_ragged_eofs=False
+        )
+        request.addfinalizer(server_sock.close)
+        server_sock.bind(("127.0.0.1", 0))
+        server_sock.listen()
+        server_thread = Thread(target=serve_sync, daemon=True)
+        server_thread.start()
+        request.addfinalizer(server_thread.join)
+
+        stream = await connect_tcp(*server_sock.getsockname())
+        async with await TLSStream.wrap(
+            stream, hostname="localhost", ssl_context=client_context
+        ) as wrapper:
+            assert await wrapper.receive() == b"hello"
+            with pytest.raises(NotImplementedError, match=r"requires at least TLSv1.3"):
+                await wrapper.send_eof()
+
+    @pytest.mark.skipif(
+        not getattr(ssl, "HAS_TLSv1_3", False), reason="No TLS 1.3 support"
+    )
+    async def test_send_eof_half_close(
+        self, server_context: ssl.SSLContext, client_context: ssl.SSLContext
+    ) -> None:
+        """
+        The client finishes its send direction with a single close_notify, then
+        keeps reading. The server drains the request, observes the end of the
+        client's send direction, replies in two chunks and then half-closes
+        itself. Both chunks must arrive intact and the client must see a clean
+        end of stream; a second send must report a closed resource.
+
+        """
+        server_send, server_receive = create_memory_object_stream[bytes](4)
+        client_send, client_receive = create_memory_object_stream[bytes](4)
+        client_transport = StapledObjectStream(client_send, server_receive)
+        server_transport = StapledObjectStream(server_send, client_receive)
+        server_eof_received = Event()
+        server_finished = Event()
+
+        async def serve() -> None:
+            async with await TLSStream.wrap(
+                server_transport, server_side=True, ssl_context=server_context
+            ) as server_tls:
+                request = await server_tls.receive()
+                assert request == b"request"
+                with pytest.raises(EndOfStream):
+                    await server_tls.receive()
+
+                # The client's close_notify has been observed; any data sent
+                # from here on must still reach the half-closed client
+                server_eof_received.set()
+                await server_tls.send(b"result part 1")
+                await server_tls.send(b"result part 2")
+                await server_tls.send_eof()
+                await server_finished.wait()
+
+        async with create_task_group() as tg:
+            tg.start_soon(serve)
+            async with await TLSStream.wrap(
+                client_transport,
+                hostname="localhost",
+                ssl_context=client_context,
+            ) as client_tls:
+                await client_tls.send(b"request")
+                await client_tls.send_eof()
+
+                # Idempotent: a second call does nothing and sends no extra
+                # close_notify
+                await client_tls.send_eof()
+
+                # The sending direction is closed; further sends fail with a
+                # stable, deterministic error
+                with pytest.raises(ClosedResourceError):
+                    await client_tls.send(b"late")
+
+                await server_eof_received.wait()
+                assert await client_tls.receive() == b"result part 1"
+                assert await client_tls.receive() == b"result part 2"
+                with pytest.raises(EndOfStream):
+                    await client_tls.receive()
+
+                server_finished.set()
+
+    @pytest.mark.skipif(
+        not getattr(ssl, "HAS_TLSv1_3", False), reason="No TLS 1.3 support"
+    )
+    async def test_send_eof_simultaneous(
+        self, server_context: ssl.SSLContext, client_context: ssl.SSLContext
+    ) -> None:
+        """
+        Both ends half-close at roughly the same time. Each side must send its
+        close_notify exactly once, still receive the data queued by the peer,
+        observe a clean end of stream, and complete the full closing handshake
+        on aclose() without deadlocking or raising.
+
+        """
+        server_send, server_receive = create_memory_object_stream[bytes](4)
+        client_send, client_receive = create_memory_object_stream[bytes](4)
+        client_transport = StapledObjectStream(client_send, server_receive)
+        server_transport = StapledObjectStream(server_send, client_receive)
+        both_half_closed = Event()
+
+        async def serve() -> None:
+            server_tls = await TLSStream.wrap(
+                server_transport,
+                server_side=True,
+                ssl_context=server_context,
             )
+            await server_tls.send(b"server request")
+            await server_tls.send_eof()
+            await both_half_closed.wait()
+
+            # Data the client sent before its close_notify is still
+            # readable
+            assert await server_tls.receive() == b"client request"
+            with pytest.raises(EndOfStream):
+                await server_tls.receive()
+
+            # Full close must complete the second shutdown step without
+            # sending another close_notify or hanging
+            await server_tls.aclose()
+            await server_transport.aclose()
+
+        async with create_task_group() as tg:
+            tg.start_soon(serve)
+            client_tls = await TLSStream.wrap(
+                client_transport,
+                hostname="localhost",
+                ssl_context=client_context,
+            )
+            await client_tls.send(b"client request")
+            await client_tls.send_eof()
+            both_half_closed.set()
+
+            assert await client_tls.receive() == b"server request"
+            with pytest.raises(EndOfStream):
+                await client_tls.receive()
+
+            await client_tls.aclose()
+            await client_transport.aclose()
+
+    @pytest.mark.skipif(
+        not getattr(ssl, "HAS_TLSv1_3", False), reason="No TLS 1.3 support"
+    )
+    async def test_send_eof_over_real_socket(
+        self, server_context: ssl.SSLContext, client_context: ssl.SSLContext
+    ) -> None:
+        """
+        End-to-end check against a synchronous stdlib SSLSocket peer: the
+        peer reads the complete request, confirms the client's close_notify,
+        then sends the result in two chunks and half-closes its own side.
+
+        """
+
+        def serve_sync() -> None:
+            conn, _addr = server_sock.accept()
+            try:
+                chunks: list[bytes] = []
+                while True:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+
+                    chunks.append(chunk)
+
+                assert b"".join(chunks) == b"request"
+                conn.sendall(b"result part 1")
+                conn.sendall(b"result part 2")
+                conn.unwrap()
+            finally:
+                conn.close()
 
         server_sock = server_context.wrap_socket(
             socket.socket(), server_side=True, suppress_ragged_eofs=False
@@ -461,23 +620,84 @@ class TestTLSStream:
         server_thread = Thread(target=serve_sync, daemon=True)
         server_thread.start()
 
-        stream = await connect_tcp(*server_sock.getsockname())
-        async with await TLSStream.wrap(
-            stream, hostname="localhost", ssl_context=client_context
-        ) as wrapper:
-            assert await wrapper.receive() == b"hello"
-            with pytest.raises(NotImplementedError) as exc:
+        try:
+            stream = await connect_tcp(*server_sock.getsockname())
+            async with await TLSStream.wrap(
+                stream, hostname="localhost", ssl_context=client_context
+            ) as wrapper:
+                await wrapper.send(b"request")
                 await wrapper.send_eof()
+                with pytest.raises(ClosedResourceError):
+                    await wrapper.send(b"late")
 
-            exc.match(expected_pattern)
+                received = b""
+                while True:
+                    try:
+                        received += await wrapper.receive()
+                    except EndOfStream:
+                        break
 
-        server_thread.join()
-        server_sock.close()
+                assert received == b"result part 1result part 2"
+        finally:
+            server_thread.join()
+            server_sock.close()
 
     @pytest.mark.skipif(
-        not hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"),
-        reason="The ssl module does not have the OP_IGNORE_UNEXPECTED_EOF attribute",
+        not getattr(ssl, "HAS_TLSv1_3", False), reason="No TLS 1.3 support"
     )
+    async def test_send_eof_broken_transport(
+        self, server_context: ssl.SSLContext, client_context: ssl.SSLContext
+    ) -> None:
+        """
+        If the transport fails while the close_notify is being sent, existing
+        error paths are preserved: the stream is marked broken and subsequent
+        use raises BrokenResourceError, and aclose() skips the handshake.
+
+        """
+        server_send, server_receive = create_memory_object_stream[bytes](4)
+        client_send, client_receive = create_memory_object_stream[bytes](4)
+        client_transport = StapledObjectStream(client_send, server_receive)
+        server_transport = StapledObjectStream(server_send, client_receive)
+        server_ready = Event()
+        test_done = Event()
+
+        async def serve() -> None:
+            server_tls = await TLSStream.wrap(
+                server_transport,
+                server_side=True,
+                ssl_context=server_context,
+            )
+            server_ready.set()
+            try:
+                await test_done.wait()
+            finally:
+                await aclose_forcefully(server_tls)
+                await server_transport.aclose()
+
+        async with create_task_group() as tg:
+            tg.start_soon(serve)
+            wrapper = await TLSStream.wrap(
+                client_transport,
+                hostname="localhost",
+                ssl_context=client_context,
+            )
+            await server_ready.wait()
+            with mock.patch.object(
+                client_transport,
+                "send",
+                side_effect=ConnectionResetError("transport gone"),
+            ):
+                with pytest.raises(ConnectionResetError):
+                    await wrapper.send_eof()
+
+            with pytest.raises(BrokenResourceError):
+                await wrapper.send(b"anything")
+
+            # Must not attempt the closing handshake on a broken stream
+            await wrapper.aclose()
+            await client_transport.aclose()
+            test_done.set()
+
     async def test_default_context_ignore_unexpected_eof_flag_off(self) -> None:
         send1, receive1 = create_memory_object_stream[bytes]()
         client_stream = StapledObjectStream(send1, receive1)

@@ -218,6 +218,27 @@ use on either side.
 
 .. _trustme: https://pypi.org/project/trustme/
 
+Half-closing a TLS stream
+*************************
+
+A batch client that has finished sending its requests for a given round can
+half-close the sending direction of a TLS stream with
+:meth:`~.streams.tls.TLSStream.send_eof`. On a TLS 1.3 connection this sends a
+single ``close_notify`` alert to the peer while keeping the receiving direction
+open, so the application data the peer has already queued (or sends afterwards)
+can still be read until the peer closes its own sending direction and the next
+:meth:`~.streams.tls.TLSStream.receive` raises :class:`~anyio.EndOfStream`.
+
+The method is idempotent: successive calls do nothing and never send a second
+``close_notify``. After calling it, attempting to :meth:`~.streams.tls.TLSStream.send`
+more data raises :class:`~anyio.ClosedResourceError`. A later
+:meth:`~.streams.tls.TLSStream.aclose` simply completes the second half of the
+closing handshake, so both sides can close their sending directions in any order
+without duplicate alerts or deadlocks.
+
+Half-closing requires TLS 1.3; on older protocol versions ``send_eof()`` raises
+:class:`NotImplementedError`.
+
 Dealing with ragged EOFs
 ************************
 
