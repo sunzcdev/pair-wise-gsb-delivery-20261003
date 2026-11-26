@@ -7,6 +7,7 @@
 
 require "async/promise"
 
+require "stringio"
 require "sus/fixtures/async"
 
 describe Async::Promise do
@@ -337,6 +338,132 @@ describe Async::Promise do
 		end
 	end
 	
+	with "observation and handling" do
+		it "returns a recognizable timeout observation without settling the promise" do
+			observation = promise.observe(timeout: 0)
+
+			expect(observation).to be(:timeout?)
+			expect(observation.state).to be == :timeout
+			expect(observation).not.to be(:resolved?)
+			expect(promise.resolved).to be_nil
+			expect(promise).not.to be(:resolved?)
+
+			# A timeout attribution must not mark a future rejection handled:
+			observation.handle!
+			expect(observation).not.to be(:handled?)
+			expect(promise).not.to be(:handled?)
+		end
+
+		it "keeps a late rejection distinct from a short timeout" do
+			timeout_error = nil
+
+			begin
+				promise.wait(timeout: 0)
+			rescue Async::TimeoutError => error
+				timeout_error = error
+			end
+
+			expect(timeout_error).to be_a(Async::TimeoutError)
+			expect(promise.resolved).to be_nil
+
+			original_error = RuntimeError.new("late failure")
+			promise.reject(original_error)
+
+			delivered_error = nil
+			begin
+				promise.wait
+			rescue RuntimeError => error
+				delivered_error = error
+				promise.mark_handled!
+			end
+
+			expect(delivered_error).to be == original_error
+			expect(promise.failed?).to be == true
+			expect(promise).to be(:observed?)
+			expect(promise).to be(:handled?)
+			expect(promise).not.to be(:unobserved?)
+			expect(promise).not.to be(:unhandled?)
+		end
+
+		it "attributes handling to the observer that receives the late rejection" do
+			first = promise.observe(timeout: 0)
+			error = RuntimeError.new("synthetic error")
+
+			reader = Thread.new do
+				promise.observe
+			end
+
+			Thread.pass until promise.waiting?
+			sleep(0.01)
+			promise.reject(error)
+
+			second = reader.value
+
+			expect(first).to be(:timeout?)
+			expect(promise.failed?).to be == true
+			expect(second).to be(:failed?)
+			expect(second.rejected?).to be == true
+			expect(second.error).to be == error
+
+			second.handle!
+
+			expect(second).to be(:handled?)
+			expect(promise).to be(:observed?)
+			expect(promise).to be(:handled?)
+			expect(promise).not.to be(:unobserved?)
+			expect(promise.report[:state]).to be == :failed
+			expect(promise.report[:failure_observations]).to be == 1
+			expect(promise.report[:handled_count]).to be == 1
+		end
+
+		it "reports a late rejection with no remaining observer as unobserved" do
+			first = promise.observe(timeout: 0)
+			second = promise.observe(timeout: 0)
+
+			sleep(0.01)
+			error = RuntimeError.new("nobody read this")
+			promise.reject(error)
+
+			expect(first).to be(:timeout?)
+			expect(second).to be(:timeout?)
+			expect(promise.resolved).to be == :failed
+			expect(promise.value).to be == error
+			expect(promise).not.to be(:observed?)
+			expect(promise).to be(:unobserved?)
+			expect(promise).to be(:unhandled?)
+
+			stderr = $stderr
+			captured = StringIO.new
+			$stderr = captured
+			begin
+				expect(promise.warn_if_unobserved!).to be == true
+			ensure
+				$stderr = stderr
+			end
+
+			expect(captured.string).to be =~ /not observed or handled/
+			expect(captured.string).to be =~ /nobody read this/
+		end
+
+		it "can mark an already rejected promise handled by a later observer" do
+			error = RuntimeError.new("read after rejection")
+			promise.reject(error)
+
+			observation = promise.observe
+
+			expect(observation).to be(:failed?)
+			expect(observation.error).to be == error
+			expect(promise).to be(:observed?)
+			expect(promise).not.to be(:handled?)
+
+			observation.mark_as_handled!
+
+			expect(observation).to be(:handled?)
+			expect(promise).to be(:handled?)
+			expect(promise).not.to be(:unhandled?)
+		end
+	end
+
 	with "#cancel" do
 		it "can be cancelled" do
 			promise.cancel

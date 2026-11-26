@@ -212,6 +212,37 @@ module Async
 				self.running? ? :running : :initialized
 			end
 		end
+
+		# Whether the terminal failure was delivered to a promise observer.
+		# @returns [Boolean]
+		def observed?
+			@promise.observed?
+		end
+
+		# Whether an observer explicitly marked the terminal failure as handled.
+		# @returns [Boolean]
+		def handled?
+			@promise.handled?
+		end
+
+		# Whether the terminal failure currently has no promise observer.
+		# @returns [Boolean]
+		def unobserved?
+			@promise.unobserved?
+		end
+
+		# Whether the terminal failure lacks an explicit handling mark.
+		# @returns [Boolean]
+		def unhandled?
+			@promise.unhandled?
+		end
+
+		# Diagnostic state describing observation and handling of the terminal result.
+		# @returns [Hash]
+		def observation_report
+			@promise.observation_report
+		end
+		alias report observation_report
 		
 		# Begin the execution of the task.
 		#
@@ -225,7 +256,7 @@ module Async
 					block.call(self, *arguments)
 				rescue => error
 					# I'm not completely happy with this overhead, but the alternative is to not log anything which makes debugging extremely difficult. Maybe we can introduce a debug wrapper which adds extra logging.
-					unless @promise.waiting?
+					if @promise.unobserved?
 						warn(self, "Task may have ended with unhandled exception.", exception: error)
 					end
 					
