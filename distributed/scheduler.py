@@ -225,6 +225,13 @@ class ClientState:
     #: Output of :func:`distributed.versions.get_versions` on the client
     versions: dict[str, Any]
 
+    #: Graph update calls currently registering tasks for this client. An
+    #: opaque registration id maps to the requested output keys.
+    graph_registrations: dict[str, set[Key]]
+
+    #: Output keys whose client withdrew/cancelled before registration committed.
+    cancelled_graph_keys: set[Key]
+
     __slots__ = tuple(__annotations__)
 
     def __init__(self, client: str, *, versions: dict[str, Any] | None = None):
@@ -233,6 +240,8 @@ class ClientState:
         self.wants_what = set()
         self.last_seen = time()
         self.versions = versions or {}
+        self.graph_registrations = {}
+        self.cancelled_graph_keys = set()
 
     def __hash__(self) -> int:
         return self._hash
@@ -4920,10 +4929,30 @@ class Scheduler(SchedulerState, ServerNode):
 
         self.client_desires_keys(keys=keys, client=client)
 
+        cs = self.clients[client]
+        cancelled_keys = set(keys) & cs.cancelled_graph_keys
+        if cancelled_keys:
+            # The client withdrew these outputs while update_graph was waiting
+            # or registering state. Remove only this client's claim. If nobody
+            # else wants the tasks, the normal release/forgotten propagation
+            # reclaims the exclusive closure; shared dependencies remain.
+            cancel_recs: Recs = {}
+            self._client_releases_keys(
+                keys=cancelled_keys, cs=cs, recommendations=cancel_recs
+            )
+            self.transitions(cancel_recs, stimulus_id)
+            cs.cancelled_graph_keys.difference_update(cancelled_keys)
+            keys.difference_update(cancelled_keys)
+            if not keys:
+                return metrics
+
         # Add actors
         if actors is True:
             actors = list(keys)
         for actor in actors or []:
+            if actor not in keys:
+                # Withdrawn before the graph was committed.
+                continue
             ts = self.tasks[actor]
             ts.actor = True
 
@@ -5014,6 +5043,14 @@ class Scheduler(SchedulerState, ServerNode):
         self._active_graph_updates += 1
         evt_msg: dict[str, Any]
 
+        graph_client = self.clients.get(client)
+        if graph_client is None:
+            graph_client = ClientState(client)
+            self.clients[client] = graph_client
+        registration_id = uuid.uuid4().hex
+        graph_client.graph_registrations[registration_id] = set(keys)
+        existing_task_keys: set[Key] | None = None
+
         try:
             logger.debug("Received new graph. Deserializing...")
             try:
@@ -5058,6 +5095,18 @@ class Scheduler(SchedulerState, ServerNode):
             # has to happen in the same event loop.
             # *************************************
 
+            withdrawn_keys = set(keys) & graph_client.cancelled_graph_keys
+            if withdrawn_keys:
+                keys.difference_update(withdrawn_keys)
+                if not keys:
+                    evt_msg = {
+                        "action": "update-graph",
+                        "stimulus_id": stimulus_id,
+                        "status": "withdrawn",
+                    }
+                    self.log_event(["scheduler", client], evt_msg)
+                    return
+
             if self._find_lost_dependencies(dsk, keys):
                 self.report(
                     {
@@ -5079,6 +5128,7 @@ class Scheduler(SchedulerState, ServerNode):
                 return
 
             before = len(self.tasks)
+            existing_task_keys = set(self.tasks)
 
             metrics = self._create_taskstate_from_graph(
                 dsk=dsk,
@@ -5116,6 +5166,38 @@ class Scheduler(SchedulerState, ServerNode):
             self.log_event(["scheduler", client], evt_msg)
             logger.debug("Task state created. %i new tasks", len(self.tasks) - before)
         except Exception as e:
+            if existing_task_keys is not None:
+                # Materialization/ordering happened before any TaskState was
+                # created. If state creation/commit fails after registering some
+                # exclusive nodes, roll back those new output keys. Propagation
+                # reclaims their exclusive dependencies while pre-existing tasks
+                # (including shared dependencies wanted by another client) stay.
+                new_task_keys = set(self.tasks) - existing_task_keys
+                rollback_recs: Recs = {}
+                rollback_client = self.clients.get(client)
+                if rollback_client is not None:
+                    self._client_releases_keys(
+                        keys=[key for key in keys if key in new_task_keys],
+                        cs=rollback_client,
+                        recommendations=rollback_recs,
+                    )
+                for key in keys:
+                    ts = self.tasks.get(key)
+                    if (
+                        key in new_task_keys
+                        and key not in rollback_recs
+                        and ts is not None
+                        and not ts.who_wants
+                        and not ts.processing_on
+                        and ts.state in ("released", "erred")
+                    ):
+                        rollback_recs[key] = "forgotten"
+                if rollback_recs:
+                    try:
+                        self.transitions(rollback_recs, stimulus_id)
+                    except Exception:
+                        logger.exception("Failed to roll back partial graph update")
+
             evt_msg = {
                 "action": "update-graph",
                 "stimulus_id": stimulus_id,
@@ -5137,6 +5219,10 @@ class Scheduler(SchedulerState, ServerNode):
                     client=client,
                 )
         finally:
+            registered_keys = graph_client.graph_registrations.pop(
+                registration_id, set()
+            )
+            graph_client.cancelled_graph_keys.difference_update(registered_keys)
             self._active_graph_updates -= 1
             assert self._active_graph_updates >= 0
             end = time()
@@ -5758,18 +5844,35 @@ class Scheduler(SchedulerState, ServerNode):
     def stimulus_cancel(
         self, keys: Collection[Key], client: str, force: bool, reason: str, msg: str
     ) -> None:
-        """Stop execution on a list of keys"""
+        """Stop execution on a list of keys.
+
+        Cancellation is scoped to the requesting client's ownership. A key that is
+        only present in an in-progress graph registration is marked as withdrawn;
+        :meth:`update_graph` honors that boundary before scheduling the graph.
+        """
         logger.info("Client %s requests to cancel %d keys", client, len(keys))
         self.log_event(client, {"action": "cancel", "count": len(keys), "force": force})
         cs = self.clients.get(client)
         if not cs:
             return
 
+        pending_keys: set[Key] = set()
+        for registered_keys in cs.graph_registrations.values():
+            pending_keys.update(registered_keys)
+
         cancelled_keys = []
+        withdrawn_keys = []
         clients = []
         for key in keys:
             ts = self.tasks.get(key)
-            if not ts:
+            pending_registration = key in pending_keys
+            if ts is None:
+                if pending_registration:
+                    # The graph request is still materializing/ordering and has
+                    # not created TaskStates yet. Remember the withdrawal so
+                    # update_graph does not commit this output afterwards.
+                    cs.cancelled_graph_keys.add(key)
+                    withdrawn_keys.append(key)
                 continue
 
             if force or ts.who_wants == {cs}:  # no one else wants this key
@@ -5783,12 +5886,29 @@ class Scheduler(SchedulerState, ServerNode):
                     )
                 logger.info("Scheduler cancels key %s.  Force=%s", key, force)
                 cancelled_keys.append(key)
+            elif pending_registration:
+                # The TaskState exists but this update_graph has not established
+                # ownership/transitioned it yet. Withdraw only this client's
+                # pending claim. Pre-existing owners keep the shared closure.
+                if not ts.who_wants and ts.dependents:
+                    self.stimulus_cancel(
+                        [dts.key for dts in ts.dependents],
+                        client,
+                        force=force,
+                        reason=reason,
+                        msg=msg,
+                    )
+                cs.cancelled_graph_keys.add(key)
+                withdrawn_keys.append(key)
+                continue
+
             assert ts.who_wants
             clients.extend(list(ts.who_wants) if force else [cs])
-        for cs in clients:
+
+        for owner_state in clients:
             self.client_releases_keys(
                 keys=cancelled_keys,
-                client=cs.client_key,
+                client=owner_state.client_key,
                 stimulus_id=f"cancel-key-{time()}",
             )
         self.report(
@@ -5799,6 +5919,18 @@ class Scheduler(SchedulerState, ServerNode):
                 "msg": msg,
             }
         )
+        if withdrawn_keys:
+            # Do not broadcast a shared dependency withdrawal to another client
+            # whose Future is still live.
+            self.report(
+                {
+                    "op": "cancelled-keys",
+                    "keys": withdrawn_keys,
+                    "reason": reason,
+                    "msg": msg,
+                },
+                client=client,
+            )
 
     def client_desires_keys(self, keys: Collection[Key], client: str) -> None:
         cs = self.clients.get(client)
