@@ -91,7 +91,7 @@ if multi-message acknowledgements are not used.
 
 ## Consumer Work Pools
 
-Every channel maintains a fixed size thread pool used to dispatch
+Every channel maintains a thread pool used to dispatch
 deliveries (messages pushed by RabbitMQ to consumers). By default
 every pool has size of 1 to guarantee ordered message processing
 by default.
@@ -114,6 +114,38 @@ that do nothing.
 It also reduces the amount of time it takes to open
 a channel, which is desirable for applications doing
 heavy request/reply (RPC) communication.
+
+### Per-consumer ordering
+
+With a pool of more than one worker, deliveries belonging to
+**different consumers** are processed concurrently, but callbacks
+of a **single consumer still start strictly in delivery order**.
+Bunny achieves this with consumer affinity: every consumer tag is
+bound to one worker at a time, and no later delivery of that
+consumer starts anywhere while its previous callback is still
+running. Different consumers therefore never block each other,
+while each consumer keeps its own ordering guarantee.
+
+### Resizing a running pool
+
+The pool size can be changed while the connection keeps running,
+for example to increase callback concurrency during a traffic spike
+and reduce it afterwards:
+
+``` ruby
+# grows the pool to 8 worker threads, then shrinks it back to 2
+ch.resize_consumer_pool(8)
+# ...
+ch.resize_consumer_pool(2)
+```
+
+Growing the pool adds workers that immediately start sharing work.
+Shrinking marks surplus workers as draining: the block a draining
+worker is already executing always finishes on that original
+worker, and the consumer queues it owned are handed over to the
+remaining workers. No block is dropped or executed twice, and the
+per-consumer ordering described above is preserved across the
+migration.
 
 
 ## Mutex Reentrancy

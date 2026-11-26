@@ -2194,7 +2194,7 @@ module Bunny
         send_basic_cancel_ok(method.consumer_tag) if @connection.server_has_capability?(:accept_consumer_cancel_ok)
 
         if consumer = @consumers[method.consumer_tag]
-          @work_pool.submit do
+          @work_pool.submit(consumer_tag: method.consumer_tag) do
             begin
               if recovers_cancelled_consumers?
                 consumer.handle_cancellation(method)
@@ -2282,7 +2282,7 @@ module Bunny
       # the server counts deliveries for unknown consumers as well
       delivery_tag = next_consumer_delivery_tag(basic_deliver.delivery_tag)
       if consumer
-        @work_pool.submit do
+        @work_pool.submit(consumer_tag: tag) do
           deliver_to_consumer(consumer, basic_deliver, properties, content, delivery_tag)
         end
       else
@@ -2487,6 +2487,24 @@ module Bunny
       if @work_pool && !@work_pool.running?
         @work_pool.start
       end
+    end
+
+    # Resizes the consumer work pool while the channel keeps running.
+    #
+    # Growing the pool increases the concurrency at which callbacks of *different*
+    # consumers run. Callbacks of a single consumer still start strictly in
+    # delivery order: the consumer's currently running block always finishes on
+    # its original worker, and no later block of that consumer starts anywhere
+    # until it completes. Shrinking lets surplus workers finish their in-flight
+    # blocks and hands their queued consumer queues over to the remaining
+    # workers, so no block is dropped or executed twice.
+    #
+    # @param [Integer] new_size new number of worker threads, must be >= 1
+    # @return [Integer] the new pool size
+    # @see Bunny::ConsumerWorkPool#resize
+    # @api public
+    def resize_consumer_pool(new_size)
+      @work_pool.resize(new_size)
     end
 
     # @private
