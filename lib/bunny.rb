@@ -12,6 +12,7 @@ require "bunny/exceptions"
 
 require "bunny/socket"
 require "bunny/timestamp"
+require "bunny/network_activity_monitor"
 require "bunny/timeout"
 
 begin

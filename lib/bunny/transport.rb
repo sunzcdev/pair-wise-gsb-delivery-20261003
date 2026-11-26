@@ -10,6 +10,7 @@ end
 
 require "bunny/exceptions"
 require "bunny/socket"
+require "bunny/concurrent/atomic_fixnum"
 
 module Bunny
   # @private
@@ -24,6 +25,18 @@ module Bunny
 
     DEFAULT_READ_TIMEOUT  = 30.0
     DEFAULT_WRITE_TIMEOUT = 30.0
+
+    # Generates per-connection identifiers for the network activity monitors.
+    # Every transport instance (including the ones created during recovery)
+    # gets its own identifier and therefore its own activity record.
+    @connection_sequence = Bunny::Concurrent::AtomicFixnum.new(0)
+
+    class << self
+      # @private
+      def next_connection_id
+        @connection_sequence.get_and_increment
+      end
+    end
 
     # mimics METHODS_MAP in ssl.rb but also lists TLS 1.3
     # and string constants
@@ -51,6 +64,10 @@ module Bunny
 
     attr_reader :session, :host, :port, :socket, :connect_timeout, :read_timeout, :write_timeout, :disconnect_timeout
     attr_reader :tls_context, :verify_peer, :tls_ca_certificates, :tls_certificate_path, :tls_key_path
+    # Per-connection record of the frames actually written and read on this
+    # transport. Replaced together with the transport on recovery, so stale
+    # callbacks on a previous connection can never refresh its timers.
+    attr_reader :network_activity
 
     def read_timeout=(v)
       @read_timeout = v
@@ -82,6 +99,15 @@ module Bunny
       @writes_mutex       = @session.mutex_impl.new
 
       @socket = nil
+
+      # Each transport owns its own activity monitor: once a connection has
+      # been replaced during recovery, late write/read callbacks of the old
+      # transport update the old monitor only and cannot touch the timers of
+      # the new connection. The clock is injectable for deterministic tests.
+      @network_activity = NetworkActivityMonitor.new(
+        connection_id: self.class.next_connection_id,
+        clock:         opts[:network_activity_clock]
+      )
 
       prepare_tls_context(opts) if @tls_enabled
     end
@@ -165,6 +191,9 @@ module Bunny
         if open?
           @writes_mutex.synchronize do
             @socket.write_nonblock_fully(data, @write_timeout)
+            # the full frame has actually left the process: only now does the
+            # write side of this connection make progress
+            @network_activity.record_write!(data)
           end
         end
       rescue SystemCallError, Timeout::Error, Bunny::ConnectionError, IOError => e
@@ -186,6 +215,9 @@ module Bunny
         @writes_mutex.synchronize do
           @socket.write(data)
           @socket.flush
+          # writing completed and the bytes were flushed: record the exact
+          # frame on this connection's write-side timer
+          @network_activity.record_write!(data)
         end
       rescue SystemCallError, Bunny::ConnectionError, IOError => e
         close
@@ -283,7 +315,12 @@ module Bunny
 
       # 2) the size is OK, but the string doesn't end with FINAL_OCTET
       raise NoFinalOctetError.new if frame_end != AMQ::Protocol::Frame::FINAL_OCTET
-      AMQ::Protocol::Frame.new(type, payload, channel)
+      frame = AMQ::Protocol::Frame.new(type, payload, channel)
+
+      # a complete, legal frame was actually received: this is read-side
+      # progress for this connection (heartbeat frames included)
+      @network_activity.record_read!(frame)
+      frame
     end
 
     # @private

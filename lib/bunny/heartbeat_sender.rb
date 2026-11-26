@@ -4,7 +4,21 @@ require "amq/protocol/client"
 require "amq/protocol/frame"
 
 module Bunny
-  # Periodically sends heartbeats, keeping track of the last publishing activity.
+  # Periodically sends heartbeats.
+  #
+  # The decision whether a heartbeat has to be sent is based on the transport's
+  # {Bunny::NetworkActivityMonitor}, not on an optimistic timestamp updated when
+  # a frame is merely enqueued:
+  #
+  #   * a publishing thread may have queued data that the transport has not
+  #     finished writing yet,
+  #   * the reader thread may be receiving frames from the peer,
+  #
+  # and only progress in the write direction of the connection this sender is
+  # bound to can defer a heartbeat. A monitor belongs to exactly one transport,
+  # so when the connection is replaced during recovery, write callbacks that
+  # eventually complete on the old transport cannot refresh the timers of the
+  # new one.
   #
   # @private
   class HeartbeatSender
@@ -17,8 +31,6 @@ module Bunny
       @transport = transport
       @logger    = logger
       @mutex     = Monitor.new
-
-      @last_activity_time = Bunny::Timestamp.monotonic
     end
 
     def start(period = 30)
@@ -38,8 +50,14 @@ module Bunny
       @mutex.synchronize { @thread.exit }
     end
 
+    # Kept for backwards compatibility.
+    #
+    # Historically this optimistically refreshed a shared "last activity"
+    # timestamp as soon as a frame was handed to the transport. Timing is now
+    # driven by frames that were *actually* written (and read), recorded on the
+    # transport's monitor, so this method no longer changes any timer.
     def signal_activity!
-      @last_activity_time = Bunny::Timestamp.monotonic
+      # no-op: see NetworkActivityMonitor and Transport#write
     end
 
     protected
@@ -61,10 +79,22 @@ module Bunny
     end
 
     def beat
-      now = Bunny::Timestamp.monotonic
+      monitor = @transport.network_activity
 
-      if now > (@last_activity_time + @interval)
-        @logger.debug { "Sending a heartbeat, last activity time: #{@last_activity_time}, interval (s): #{@interval}" }
+      # Preserve the original idle-connection contract: a heartbeat is due
+      # only when this connection's write side has made no progress for a
+      # full interval. Queued-but-unwritten data does not count; traffic
+      # observed in the read direction does not suppress a heartbeat either,
+      # matching the previous behavior where only outgoing activity did.
+      if monitor.write_idle_for?(@interval)
+        activity = monitor.to_h
+        @logger.debug do
+          "Sending a heartbeat, connection: #{activity[:connection_id]}, " \
+          "last write at: #{activity[:last_write_at]}, " \
+          "last read at: #{activity[:last_read_at]}, " \
+          "frames written: #{activity[:frames_written]}, " \
+          "frames read: #{activity[:frames_read]}, interval (s): #{@interval}"
+        end
         @transport.write_without_timeout(AMQ::Protocol::HeartbeatFrame.encode, true)
       end
     end

@@ -1,6 +1,20 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Heartbeat Timing Now Tracks Frames Actually Written and Read
+
+Each transport owns a `Bunny::NetworkActivityMonitor` that records the exact
+frames actually written to the socket and the complete legal frames actually
+read, with independent write-side and read-side timers.
+
+The write-side timer is refreshed only once a write has completed, not when a
+frame is merely enqueued, so a publish blocked in the transport no longer keeps
+heartbeats at bay. The read-side timer is refreshed when a frame is received but
+does not suppress heartbeats, preserving the previous idle-connection sending
+behavior.
+
+Monitors are per connection: a write that eventually completes on a transport
+replaced during recovery updates only that old monitor and can never reset the
+timers of the connection that took over.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)

@@ -1489,6 +1489,9 @@ module Bunny
 
     # @private
     def signal_activity!
+      # Timers are driven by the per-transport NetworkActivityMonitor, which
+      # is updated only once a frame has actually been written (or read).
+      # Kept for backwards compatibility; see HeartbeatSender#signal_activity!.
       @heartbeat_sender.signal_activity! if @heartbeat_sender
     end
 
@@ -1500,11 +1503,9 @@ module Bunny
     # @private
     def send_frame(frame, signal_activity = true)
       if open?
-        # @transport_mutex.synchronize do
-        #   @transport.write(frame.encode)
-        # end
+        # the write-side timer is refreshed by the transport once the frame
+        # has actually been written, not optimistically here
         @transport.write(frame.encode)
-        signal_activity! if signal_activity
       else
         raise ConnectionClosedError.new(frame)
       end
@@ -1519,7 +1520,6 @@ module Bunny
     def send_frame_without_timeout(frame, signal_activity = true)
       if open?
         @transport.write_without_timeout(frame.encode)
-        signal_activity! if signal_activity
       else
         raise ConnectionClosedError.new(frame)
       end
@@ -1542,7 +1542,6 @@ module Bunny
         if open?
           data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
           @transport.write(data)
-          signal_activity!
         else
           raise ConnectionClosedError.new(frames)
         end
@@ -1564,7 +1563,6 @@ module Bunny
         if open?
           data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
           @transport.write_without_timeout(data)
-          signal_activity!
         else
           raise ConnectionClosedError.new(frames)
         end
@@ -1581,7 +1579,6 @@ module Bunny
       channel.synchronize do
         if open?
           @transport.write(data)
-          signal_activity!
         else
           raise ConnectionClosedError.new("pre-encoded data (#{data.bytesize} bytes)")
         end
