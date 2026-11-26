@@ -203,6 +203,92 @@ class SolidQueue::ReadyExecutionTest < ActiveSupport::TestCase
     assert_equal 1, SolidQueue::ReadyExecution.aggregated_count_across(%w[ queue_b* queue_b1 ])
   end
 
+  test "strict strategy lets a busy front queue starve the queues behind it" do
+    # The first group keeps getting replenished so it never runs dry; the second
+    # group only ever holds two jobs.
+    6.times { |i| AddToBufferJob.set(queue: "priority").perform_later(i) }
+    2.times { |i| AddToBufferJob.set(queue: "bulk").perform_later(i) }
+
+    strategy = SolidQueue::QueueSelector::StrictStrategy.new
+
+    4.times do
+      claimed = SolidQueue::ReadyExecution.claim(%w[ priority bulk ], 1, 42, strategy: strategy)
+      # Keep the front queue permanently busy by refilling it after every claim.
+      AddToBufferJob.set(queue: "priority").perform_later(1) if claimed.first.job.queue_name == "priority"
+    end
+
+    assert_equal 0, SolidQueue::ClaimedExecution.joins(:job).where(job: { queue_name: "bulk" }).count
+  end
+
+  test "fair strategy gives the lower queue a minimum chance within the declared window" do
+    # First group: always busy (refilled after every claim). Second group: two jobs only.
+    6.times { |i| AddToBufferJob.set(queue: "priority").perform_later(i) }
+    2.times { |i| AddToBufferJob.set(queue: "bulk").perform_later(i) }
+
+    # A single shared strategy instance, as held by a worker across polling rounds.
+    strategy = SolidQueue::QueueSelector.build_strategy(:fair, window: 2)
+    claimed_queues = []
+
+    # A small-limit worker (one job per round) claims several rounds in a row.
+    4.times do
+      claimed = SolidQueue::ReadyExecution.claim(%w[ priority bulk ], 1, 42, strategy: strategy)
+      queue_name = claimed.first.job.queue_name
+      claimed_queues << queue_name
+
+      # The first group replenishes immediately after each of its claims.
+      AddToBufferJob.set(queue: "priority").perform_later(1) if queue_name == "priority"
+    end
+
+    # The rotation alternates starting queues: within any two consecutive rounds
+    # each queue leads once, so the lower queue is reached in the declared window.
+    assert_equal %w[ priority bulk priority bulk ], claimed_queues
+    assert_equal 2, SolidQueue::ClaimedExecution.joins(:job).where(job: { queue_name: "bulk" }).count
+    # Both jobs from the two-job lower group were served, even though the front
+    # queue had work waiting in every single round.
+    assert_equal 0, SolidQueue::ReadyExecution.where(queue_name: "bulk").count
+  end
+
+  test "fair strategy respects the worker claim limit and queue-internal order" do
+    # Distinct, non-overlapping priorities inside each queue (the setup uses 1..5);
+    # order within a queue must stay (priority, id).
+    4.times { |i| AddToBufferJob.set(queue: "priority", priority: 100 + i).perform_later(i) }
+    4.times { |i| AddToBufferJob.set(queue: "bulk", priority: 200 + i).perform_later(i) }
+
+    strategy = SolidQueue::QueueSelector.build_strategy(:fair, window: 2)
+
+    first_round = SolidQueue::ReadyExecution.claim(%w[ priority bulk ], 2, 42, strategy: strategy)
+    second_round = SolidQueue::ReadyExecution.claim(%w[ priority bulk ], 2, 42, strategy: strategy)
+
+    assert_equal 2, first_round.size
+    assert_equal 2, second_round.size
+
+    # First round starts on `priority`; second round rotates to start on `bulk`.
+    assert_equal [ "priority", "priority" ], first_round.map { |execution| execution.job.queue_name }
+    assert_equal [ "bulk", "bulk" ], second_round.map { |execution| execution.job.queue_name }
+
+    # Within each queue jobs keep their (priority, id) order.
+    assert_equal [ 100, 101 ], first_round.map { |execution| execution.job.priority }
+    assert_equal [ 200, 201 ], second_round.map { |execution| execution.job.priority }
+
+    # The claim limit still applies per round: no more than the two requested
+    # jobs are taken even though four were ready in each queue.
+    assert_equal 2, SolidQueue::ReadyExecution.where(queue_name: "priority").count
+    assert_equal 2, SolidQueue::ReadyExecution.where(queue_name: "bulk").count
+  end
+
+  test "fair strategy counts queues matched by overlapping wildcards once per round" do
+    AddToBufferJob.set(queue: "queue_a1").perform_later(1)
+    AddToBufferJob.set(queue: "queue_b1").perform_later(1)
+
+    strategy = SolidQueue::QueueSelector.build_strategy(:fair, window: 2)
+
+    first = SolidQueue::ReadyExecution.claim(%w[ queue_* queue_a* queue_a1 ], 1, 42, strategy: strategy)
+    second = SolidQueue::ReadyExecution.claim(%w[ queue_* queue_a* queue_a1 ], 1, 42, strategy: strategy)
+
+    # Two distinct queues despite three declarations: rotation still alternates them.
+    assert_equal [ "queue_a1", "queue_b1" ], [ first.first.job.queue_name, second.first.job.queue_name ]
+  end
+
   test "distinct_values_of returns all distinct queue names" do
     AddToBufferJob.perform_later("hey") # goes to background queue
 

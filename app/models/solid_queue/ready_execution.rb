@@ -7,8 +7,8 @@ module SolidQueue
     assumes_attributes_from_job
 
     class << self
-      def claim(queue_list, limit, process_id)
-        QueueSelector.new(queue_list, self).scoped_relations.flat_map do |queue_relation|
+      def claim(queue_list, limit, process_id, strategy: :strict)
+        QueueSelector.new(queue_list, self, strategy: strategy).scoped_relations.flat_map do |queue_relation|
           select_and_lock(queue_relation, process_id, limit).tap do |locked|
             limit -= locked.size
           end

@@ -91,6 +91,60 @@ class ConfigurationTest < ActiveSupport::TestCase
     end
   end
 
+  test "workers default to the strict queue strategy" do
+    configuration = SolidQueue::Configuration.new(
+      workers: [ { queues: "background" } ],
+      dispatchers: [],
+      skip_recurring: true
+    )
+
+    assert_processes configuration, :worker, 1, queues: "background", queue_strategy: :strict
+  end
+
+  test "workers accept the fair queue strategy with options" do
+    configuration = SolidQueue::Configuration.new(
+      workers: [ { queues: %w[ background default ], queue_strategy: :fair, queue_strategy_options: { window: 3 } } ],
+      dispatchers: [],
+      skip_recurring: true
+    )
+
+    assert configuration.valid?
+    assert_processes configuration, :worker, 1, queue_strategy: :fair
+
+    worker = configuration.configured_processes.first.instantiate
+    assert_instance_of SolidQueue::QueueSelector::FairStrategy, worker.queue_strategy
+    assert_equal 3, worker.queue_strategy.window
+  ensure
+    worker&.stop
+  end
+
+  test "workers accept the fair queue strategy as an options hash" do
+    configuration = SolidQueue::Configuration.new(
+      workers: [ { queues: %w[ background default ], queue_strategy: { name: :fair, window: 4 } } ],
+      dispatchers: [],
+      skip_recurring: true
+    )
+
+    assert configuration.valid?
+
+    worker = configuration.configured_processes.first.instantiate
+    assert_instance_of SolidQueue::QueueSelector::FairStrategy, worker.queue_strategy
+    assert_equal 4, worker.queue_strategy.window
+  ensure
+    worker&.stop
+  end
+
+  test "workers reject an unknown queue strategy" do
+    configuration = SolidQueue::Configuration.new(
+      workers: [ { queues: "background", queue_strategy: :round_robin } ],
+      dispatchers: [],
+      skip_recurring: true
+    )
+
+    assert_not configuration.valid?
+    assert_match /Unknown queue strategy/, configuration.errors.full_messages.first
+  end
+
   test "fiber worker size inflates required database pool size on Rails 7.1" do
     skip if fiber_workers_release_connections_between_queries?
 

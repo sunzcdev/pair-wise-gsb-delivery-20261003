@@ -19,6 +19,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
 - [Configuration](#configuration)
   - [Optional scheduler configuration](#optional-scheduler-configuration)
   - [Queue order and priorities](#queue-order-and-priorities)
+    - [Queue selection strategies](#queue-selection-strategies)
   - [Queues specification and performance](#queues-specification-and-performance)
   - [Threads, processes, and signals](#threads-processes-and-signals)
   - [Database configuration](#database-configuration)
@@ -318,6 +319,31 @@ Active Job also supports positive integer priorities when enqueuing jobs. In Sol
 This is useful when you run jobs with different importance or urgency in the same queue. Within the same queue, jobs will be picked in order of priority, but in a list of queues, the queue order takes precedence, so in the previous example with `real_time,background`, jobs in the `real_time` queue will be picked before jobs in the `background` queue, even if those in the `background` queue have a higher priority (smaller value) set.
 
 We recommend not mixing queue order with priorities but either choosing one or the other, as that will make job execution order more straightforward for you.
+
+#### Queue selection strategies
+
+With the default behavior (the `strict` strategy), a queue further down the list can be starved indefinitely: as long as the queues ahead of it have jobs waiting, it never gets polled. This is exactly what you want for strict priority, but some setups need a guarantee that lower-priority queues still get a minimum level of service.
+
+You can opt into the `fair` strategy per worker:
+
+```yml
+production:
+  workers:
+    - queues: [ real_time, background ]
+      threads: 3
+      queue_strategy:
+        name: fair
+        window: 2
+```
+
+(You can also write `queue_strategy: fair` to use the default window of `2`.)
+
+The `fair` strategy rotates which queue is visited first on every polling round, advancing through the configured queues within the given `window` (number of rounds). Over `min(window, number_of_queues)` consecutive rounds, every queue up to that position gets to lead at least once, so a queue behind a permanently busy one is still reached within that window. With the default window of `2`, the first two queues simply alternate, which already protects the immediate successor of a queue that never runs dry. It keeps honoring:
+
+- the order of jobs **within** each queue (priority, then job id), and
+- the worker's claim limit per round, shared across the queues as usual.
+
+Queues resolved from duplicate or overlapping declarations (for example `queue_*`, `queue_a*` and an exact `queue_a1`) are deduplicated first, so the same physical queue is only ever counted once when rotating. The `fair` strategy only applies to explicit queue lists; `queues: "*"` polls all queues in a single query and has nothing to rotate.
 
 ### Queues specification and performance
 

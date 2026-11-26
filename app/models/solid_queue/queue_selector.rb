@@ -2,11 +2,29 @@
 
 module SolidQueue
   class QueueSelector
-    attr_reader :raw_queues, :relation
+    STRATEGIES = {
+      strict: StrictStrategy,
+      fair: FairStrategy
+    }.freeze
 
-    def initialize(queue_list, relation)
+    attr_reader :raw_queues, :relation, :strategy
+
+    def initialize(queue_list, relation, strategy: :strict, **strategy_options)
       @raw_queues = Array(queue_list).map { |queue| queue.to_s.strip }.presence || [ "*" ]
       @relation = relation
+      @strategy = self.class.build_strategy(strategy, **strategy_options)
+    end
+
+    def self.build_strategy(name, **options)
+      case name
+      when Symbol, String
+        strategy_class = STRATEGIES.fetch(name.to_sym) do
+          raise ArgumentError, "Unknown queue selection strategy: #{name.inspect}. Valid strategies: #{STRATEGIES.keys.inspect}"
+        end
+        strategy_class.new(**options)
+      else
+        name
+      end
     end
 
     def scoped_relations
@@ -14,11 +32,22 @@ module SolidQueue
       when all?  then [ relation.all ]
       when none? then [ relation.none ]
       else
-        queue_names.map { |queue_name| relation.queued_as(queue_name) }
+        ordered_queue_names.map { |queue_name| relation.queued_as(queue_name) }
       end
     end
 
     private
+      # Strategy reordering only applies to explicit queue lists. The wildcard
+      # relation covers every queue in a single query, so there is nothing to
+      # rotate there.
+      def ordered_queue_names
+        if include_all_queues?
+          queue_names
+        else
+          strategy.order(queue_names)
+        end
+      end
+
       def all?
         include_all_queues? && paused_queues.empty?
       end

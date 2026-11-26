@@ -230,6 +230,43 @@ class WorkerTest < ActiveSupport::TestCase
     assert_equal 5, JobResult.where(queue_name: :background, status: "completed", value: :immediate).count
   end
 
+  test "fair queue strategy is exposed in the worker metadata" do
+    worker = SolidQueue::Worker.new(queues: %w[ background default ], threads: 1, queue_strategy: :fair, queue_strategy_options: { window: 3 })
+
+    assert_instance_of SolidQueue::QueueSelector::FairStrategy, worker.queue_strategy
+    assert_equal 3, worker.queue_strategy.window
+    assert_equal "fair", worker.send(:queue_strategy_name)
+  ensure
+    worker&.stop
+  end
+
+  test "fair queue strategy lets a worker reach lower queues while the front queue stays busy" do
+    # The front queue is kept well stocked; with strict order it would drain all
+    # of these before ever touching the second queue. With the fair strategy
+    # (window 2), a single-threaded worker must rotate to `sparse` within two
+    # polling rounds even though `busy` never runs dry during that window.
+    10.times { AddToBufferJob.set(queue: "busy").perform_later("busy") }
+    2.times { AddToBufferJob.set(queue: "sparse").perform_later("sparse") }
+
+    worker = SolidQueue::Worker.new(
+      queues: %w[ busy sparse ],
+      threads: 1,
+      polling_interval: 0.05,
+      queue_strategy: :fair,
+      queue_strategy_options: { window: 2 }
+    )
+
+    worker.start
+
+    wait_for(timeout: 5.seconds) do
+      JobBuffer.values.count("sparse") >= 2
+    end
+
+    assert_operator JobBuffer.values.count("sparse"), :>=, 2
+  ensure
+    worker&.stop
+  end
+
   test "terminate on heartbeat when unregistered" do
     old_heartbeat_interval, SolidQueue.process_heartbeat_interval = SolidQueue.process_heartbeat_interval, 1.second
 

@@ -20,6 +20,7 @@ module SolidQueue
 
     WORKER_DEFAULTS = {
       queues: "*",
+      queue_strategy: :strict,
       threads: 3,
       processes: 1,
       polling_interval: 0.1
@@ -129,6 +130,15 @@ module SolidQueue
         workers_options.each do |options|
           if options.key?(:threads) && options.key?(:fibers)
             errors.add(:base, "Workers can specify either `threads` or `fibers`, but not both.")
+          end
+
+          if options.key?(:queue_strategy)
+            strategy_name = options[:queue_strategy]
+            strategy_name = strategy_name[:name] if strategy_name.is_a?(Hash)
+
+            unless SolidQueue::QueueSelector::STRATEGIES.key?(strategy_name.to_s.to_sym)
+              errors.add(:base, "Unknown queue strategy `#{strategy_name}`. Valid strategies: #{SolidQueue::QueueSelector::STRATEGIES.keys.join(", ")}.")
+            end
           end
         end
       end

@@ -8,7 +8,7 @@ module SolidQueue
     before_shutdown :run_stop_hooks
     after_shutdown :run_exit_hooks
 
-    attr_reader :queues, :pool
+    attr_reader :queues, :queue_strategy, :pool
 
     def initialize(**options)
       execution_pool_type = options.key?(:fibers) ? :fiber : :thread
@@ -18,6 +18,13 @@ module SolidQueue
 
       # Ensure that the queues array is deep frozen to prevent accidental modification
       @queues = Array(options[:queues]).map(&:freeze).freeze
+
+      # The strategy keeps its rotation state across polling rounds, so it is
+      # built once for the lifetime of the worker instead of per claim. Accepts
+      # either a plain name (`:fair`), a strategy instance, or a hash with
+      # options, as produced by the YAML configuration (`name: fair, window: 2`).
+      strategy_name, strategy_options = extract_queue_strategy(options)
+      @queue_strategy = SolidQueue::QueueSelector.build_strategy(strategy_name, **strategy_options)
 
       @pool = Pool.build \
         type: execution_pool_type,
@@ -29,10 +36,26 @@ module SolidQueue
     end
 
     def metadata
-      super.merge(queues: queues.join(","), pool_type: pool.type, pool_size: pool.size)
+      super.merge(queues: queues.join(","), queue_strategy: queue_strategy_name, pool_type: pool.type, pool_size: pool.size)
     end
 
     private
+      def extract_queue_strategy(options)
+        configured = options[:queue_strategy] || :strict
+
+        case configured
+        when Hash
+          configured = configured.symbolize_keys
+          [ configured.fetch(:name, :strict), configured.except(:name) ]
+        else
+          [ configured, options.fetch(:queue_strategy_options, {}) ]
+        end
+      end
+
+      def queue_strategy_name
+        queue_strategy.class.name.demodulize.underscore.sub(/_strategy\z/, "")
+      end
+
       def poll
         claim_executions.then do |executions|
           executions.each do |execution|
@@ -45,7 +68,7 @@ module SolidQueue
 
       def claim_executions
         with_polling_volume do
-          SolidQueue::ReadyExecution.claim(queues, pool.available_capacity, process_id)
+          SolidQueue::ReadyExecution.claim(queues, pool.available_capacity, process_id, strategy: queue_strategy)
         end
       end
 
