@@ -6,6 +6,9 @@ Changelog
 ------------------
 - Dropped support for Python 3.8 (:pr:`106`) `Guido Imperiale`_
 - New object :class:`KeyMap` (:pr:`110`) `Guido Imperiale`_
+- :class:`Cache` gained an optional :meth:`Cache.invalidate` notification hook for
+  per-key changes in a shared backing mapping, including monotonic version fencing for
+  delayed notifications.
 
 
 3.0.0 - 2023-04-17
