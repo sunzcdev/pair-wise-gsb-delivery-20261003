@@ -3,6 +3,15 @@
 [//]: # (comment: Don't forget to update lib/datadog/statsd/version.rb:DogStatsd::Statsd::VERSION when releasing a new version)
 
 
+## Unreleased
+
+  * [FEATURE] Add the `shortenable_text_range` event option. It designates a segment of the event
+    text that may be shortened to its longest complete UTF-8 prefix so that the whole event fits a
+    single outbound packet (the tightest of the 8KB protocol event limit and the UDP/UDS packet
+    limit). Text outside of the range, the title, the tags and the option fields are always kept
+    in full; an event whose fixed parts alone do not fit is rejected without affecting subsequent
+    metrics. Events sent without this option keep their historical behavior.
+
 ## 5.7.1 / 2025.08.20
 
   * [IMPROVEMENT] Suppress external env if origin detection is configured off. [#316][] by [@StephenWakely][]

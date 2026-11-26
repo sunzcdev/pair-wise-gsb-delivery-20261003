@@ -6,10 +6,12 @@ module Datadog
   class Statsd
     module Serialization
       class Serializer
-        def initialize(prefix: nil, container_id: nil, external_data: nil, global_tags: [])
+        def initialize(prefix: nil, container_id: nil, external_data: nil, global_tags: [],
+                       max_payload_size: MAX_EVENT_SIZE)
           @stat_serializer = StatSerializer.new(prefix, container_id, external_data, global_tags: global_tags)
           @service_check_serializer = ServiceCheckSerializer.new(container_id, external_data, global_tags: global_tags)
-          @event_serializer = EventSerializer.new(container_id, external_data, global_tags: global_tags)
+          @event_serializer = EventSerializer.new(container_id, external_data,
+            global_tags: global_tags, max_payload_size: max_payload_size)
         end
 
         # using *args would make new allocations

@@ -162,6 +162,33 @@ Some options are supported when submitting metrics, like [applying a Sample Rate
 
 After the client is created, you can start sending events to your Datadog Event Stream. See the dedicated [Event Submission: DogStatsD documentation](https://docs.datadoghq.com/events/guides/dogstatsd/?code-lang=ruby) to see how to submit an event to Datadog your Event Stream.
 
+An event is transported as a single DogStatsD packet and its text is escaped
+(newlines are protected and `|` characters are removed), which can make the
+serialized event larger than the original text. The event must also fit both
+the 8KB protocol event limit and the outbound packet limit (1432 bytes by
+default over UDP).
+
+When only part of the event text can afford to be shortened, pass
+`shortenable_text_range` with the character range (indexes on the raw,
+unescaped text) that is eligible for shortening. The library keeps the longest
+complete UTF-8 prefix of that segment which makes the whole event fit a single
+packet. The body text outside of the range, the title, the tags and the option
+fields are always preserved in full. If the fixed parts alone do not fit, the
+event is rejected (a `RuntimeError` is raised) and subsequent metrics are still
+sent normally. Calls without `shortenable_text_range` keep their historical
+behavior.
+
+```ruby
+header = "crash report\n"
+trace = build_long_stack_trace # the part that may be shortened
+footer = "\nsee runbook: https://example.com/runbook"
+text = header + trace + footer
+
+statsd.event('Unexpected crash', text,
+  shortenable_text_range: header.length...(header.length + trace.length),
+  tags: ['service:billing'])
+```
+
 ### Service Checks
 
 After the client is created, you can start sending Service Checks to Datadog. See the dedicated [Service Check Submission: DogStatsD documentation](https://docs.datadoghq.com/developers/service_checks/dogstatsd_service_checks_submission/?tab=ruby) to see how to submit a Service Check to Datadog.

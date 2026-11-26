@@ -126,10 +126,22 @@ module Datadog
 
       external_data = sanitize(ENV['DD_EXTERNAL_ENV']) if origin_detection_enabled
 
+      connection_cfg = ConnectionCfg.new(
+        host: host,
+        port: port,
+        socket_path: socket_path,
+      )
+
+      # the event serializer needs to know the outbound packet limit so that an
+      # event whose body can be shortened can be made to fit a single packet
+      max_payload_size = buffer_max_payload_size ||
+        (connection_cfg.transport_type == :udp ? UDP_DEFAULT_BUFFER_SIZE : UDS_DEFAULT_BUFFER_SIZE)
+
       @serializer = Serialization::Serializer.new(prefix: @prefix,
                                                   container_id: container_id,
                                                   external_data: external_data,
                                                   global_tags: tags,
+                                                  max_payload_size: max_payload_size,
                                                   )
 
       @cardinality = cardinality || ENV['DD_CARDINALITY'] || ENV['DATADOG_CARDINALITY']
@@ -138,18 +150,14 @@ module Datadog
       @delay_serialization = delay_serialization
 
       @forwarder = Forwarder.new(
-        connection_cfg: ConnectionCfg.new(
-          host: host,
-          port: port,
-          socket_path: socket_path,
-        ),
+        connection_cfg: connection_cfg,
 
         global_tags: tags,
         logger: logger,
 
         single_thread: single_thread,
 
-        buffer_max_payload_size: buffer_max_payload_size,
+        buffer_max_payload_size: max_payload_size,
         buffer_max_pool_size: buffer_max_pool_size,
         buffer_overflowing_stategy: buffer_overflowing_stategy,
         buffer_flush_interval: buffer_flush_interval,
@@ -382,10 +390,18 @@ module Datadog
     # @option opts [String, nil] :source_type_name (nil) Assign a source type to the event
     # @option opts [String, nil] :alert_type ('info') Can be "error", "warning", "info" or "success".
     # @option opts [Boolean, false] :truncate_if_too_long (false) Truncate the event if it is too long
+    # @option opts [Range, nil] :shortenable_text_range (nil) Range of character indexes of the event
+    #   text that is allowed to be shortened to make the event fit a single packet. Only the longest
+    #   complete UTF-8 prefix of that segment is kept (text outside of the range, the title, the tags
+    #   and the option fields are always preserved in full). If the fixed parts alone do not fit, the
+    #   event is rejected. When omitted, the event keeps its historical behavior.
     # @option opts [Array<String>] :tags tags to be added to every metric
     # @option opts [String] :cardinality The tag cardinality to use
     # @example Report an awful event:
     #   $statsd.event('Something terrible happened', 'The end is near if we do nothing', :alert_type=>'warning', :tags=>['end_of_times','urgent'])
+    # @example Shorten only the body of a long stack trace to fit the UDP packet limit:
+    #   range = (header.length)...(header.length + long_trace.length)
+    #   $statsd.event('crash', header + long_trace + footer, shortenable_text_range: range)
     def event(title, text, opts = EMPTY_OPTIONS)
       telemetry.sent(events: 1) if telemetry
 
