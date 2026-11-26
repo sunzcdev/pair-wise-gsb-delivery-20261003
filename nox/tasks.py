@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     import types
 
     from nox._options import NoxConfig
+    from nox.sessions import SessionRunner
 
 __all__ = [
     "create_report",
@@ -202,6 +203,12 @@ def filter_manifest(manifest: Manifest, global_config: NoxConfig) -> Manifest | 
             the manifest otherwise (to be sent to the next task).
 
     """
+    # Report matrix problems even when only a listing was requested: a session
+    # whose filters are invalid produced no runners, so it would otherwise
+    # silently disappear from the listing instead of explaining itself.
+    if _report_matrix_problems(manifest):
+        return 3
+
     # Shouldn't happen unless the Noxfile is empty
     if not manifest:
         logger.error(f"No sessions found in {global_config.noxfile}.")
@@ -256,6 +263,12 @@ def filter_manifest(manifest: Manifest, global_config: NoxConfig) -> Manifest | 
         # (which is an error condition later).
         manifest.filter_by_keywords(global_config.keywords)
 
+    # A filtered matrix must be internally consistent before anything runs:
+    # bad ``exclude=`` filters and colliding short names are configuration
+    # errors, not session results. Report them all, then stop.
+    if _report_matrix_problems(manifest):
+        return 3
+
     if not manifest and not global_config.list_sessions:
         logger.error("No sessions selected after filtering by keyword.")
         return 3
@@ -278,6 +291,21 @@ def filter_manifest(manifest: Manifest, global_config: NoxConfig) -> Manifest | 
 
     # Return the modified manifest.
     return manifest
+
+
+def _report_matrix_problems(manifest: Manifest) -> bool:
+    """Log any problems found while building filtered matrices.
+
+    Returns ``True`` when there was at least one problem, so the caller can stop
+    before running anything.
+    """
+    problems = getattr(manifest, "matrix_problems", ())
+    if not problems:
+        return False
+    logger.error("Error while building the session matrix.")
+    for problem in problems:
+        logger.error(problem)
+    return True
 
 
 def _produce_listing(manifest: Manifest, global_config: NoxConfig) -> None:
@@ -306,7 +334,7 @@ def _produce_listing(manifest: Manifest, global_config: NoxConfig) -> None:
         tags = f" {tag_color}[{','.join(session.tags)}]{reset}" if session.tags else ""
         description = f" -> {session.description}" if session.description else ""
 
-        print(f"{marker} {color}{session.friendly_name}{reset}{tags}{description}")
+        print(f"{marker} {color}{_listing_name(session)}{reset}{tags}{description}")
 
     print(
         f"\nsessions marked with {selected_color}*{reset} are selected, sessions marked"
@@ -314,20 +342,30 @@ def _produce_listing(manifest: Manifest, global_config: NoxConfig) -> None:
     )
 
 
+def _listing_name(session: SessionRunner) -> str:
+    """The name to show for a session, including any stable matrix identity."""
+    return getattr(session, "display_name", None) or session.friendly_name
+
+
 def _produce_json_listing(manifest: Manifest, global_config: NoxConfig) -> None:  # noqa: ARG001
     report = []
     for session, selected in manifest.list_all_sessions():
         if selected:
-            report.append(
-                {
-                    "session": session.friendly_name,
-                    "name": session.name,
-                    "description": session.description or "",
-                    "python": session.func.python,
-                    "tags": session.tags,
-                    "call_spec": getattr(session.func, "call_spec", {}),
-                }
-            )
+            entry = {
+                "session": _listing_name(session),
+                "name": session.name,
+                "description": session.description or "",
+                "python": session.func.python,
+                "tags": session.tags,
+                "call_spec": getattr(session.func, "call_spec", {}),
+            }
+            selector = getattr(session, "selector", None)
+            if selector is not None:
+                entry["selector"] = selector
+                entry["identity"] = selector
+                entry["stable_id"] = selector
+                entry["short_name"] = getattr(session, "matrix_short_name", None)
+            report.append(entry)
     print(json.dumps(report, default=str))
 
 
@@ -379,7 +417,11 @@ def honor_usage_request(manifest: Manifest, global_config: NoxConfig) -> Manifes
     # non-default sessions can also be looked up.
     session = None
     for _ in manifest._all_sessions:
-        if _.name == name or name in _.signatures:
+        if (
+            _.name == name
+            or name in _.signatures
+            or name == getattr(_, "selector", None)
+        ):
             session = _
             break
 
@@ -443,7 +485,7 @@ def run_manifest(manifest: Manifest, global_config: NoxConfig) -> list[Result]:
             )
 
         result = session.execute()
-        name = session.friendly_name
+        name = _listing_name(session)
         status = result.imperfect
         result.log(f"Session {name} {status}.")
         results.append(result)
@@ -487,7 +529,7 @@ def print_summary(
     duration_str = _duration_str(total_duration, " in {time}")
     logger.session_info(f"Ran {len(results)} sessions{duration_str}:")
     for result in results:
-        name = result.session.friendly_name
+        name = _listing_name(result.session)
         status = result.status.name.lower()
         duration_str = _duration_str(result.duration, ", took {time}")
         if result.status is Status.SKIPPED and result.reason:

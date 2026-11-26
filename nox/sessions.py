@@ -19,6 +19,7 @@ __lazy_modules__ = {
     "hashlib",
     "humanize",
     "inspect",
+    "nox._parametrize",
     "nox.command",
     "nox.logger",
     "nox.virtualenv",
@@ -47,6 +48,7 @@ import humanize
 
 import nox.command
 import nox.virtualenv
+from nox._parametrize import matrix_short_name
 from nox.logger import logger
 from nox.popen import DEFAULT_INTERRUPT_TIMEOUT, DEFAULT_TERMINATE_TIMEOUT
 from nox.virtualenv import (
@@ -1076,6 +1078,7 @@ class SessionRunner:
         manifest: Manifest,
         *,
         multi: bool = False,
+        selector: str | None = None,
     ) -> None:
         self.name = name
         self.signatures = signatures
@@ -1086,6 +1089,9 @@ class SessionRunner:
         self.posargs: list[str] = list(global_config.posargs)
         self.result: Result | None = None
         self.multi = multi
+        # The stable matrix identity of this cell, when the session opted into
+        # ``exclude=``. ``None`` keeps the legacy selection behavior.
+        self.selector = selector
 
         if getattr(func, "parametrize", None):
             self.multi = True
@@ -1116,6 +1122,29 @@ class SessionRunner:
     @property
     def friendly_name(self) -> str:
         return self.signatures[0] if self.signatures else self.name
+
+    @property
+    def matrix_short_name(self) -> str | None:
+        """The user-chosen short name of this matrix cell, if any."""
+        spec = getattr(self.func, "param_spec", None)
+        if spec is None:
+            return None
+        return matrix_short_name(spec)
+
+    @property
+    def display_name(self) -> str:
+        """The name shown in listings, logs, and reports.
+
+        For a filtered matrix this is the stable identity, with the user's
+        custom short name appended when one was declared, so a reader can
+        match a listing line to a report entry and to a ``-s`` argument.
+        """
+        if self.selector is None:
+            return self.friendly_name
+        short = self.matrix_short_name
+        if short is not None:
+            return f"{self.selector} [{short}]"
+        return self.selector
 
     @property
     def tags(self) -> list[str]:
@@ -1187,7 +1216,7 @@ class SessionRunner:
         return resolve_reuse_existing_venv(self.global_config, self.func)
 
     def execute(self) -> Result:
-        logger.session_info(f"Running session {self.friendly_name}")
+        logger.session_info(f"Running session {self.display_name}")
 
         # With --no-dependencies, prerequisites aren't queued (and may not have
         # run in this process), so skip the dependency-result check entirely.
@@ -1253,11 +1282,11 @@ class SessionRunner:
             )
 
         except KeyboardInterrupt:
-            logger.error(f"Session {self.friendly_name} interrupted.")
+            logger.error(f"Session {self.display_name} interrupted.")
             raise
 
         except Exception as exc:  # noqa: BLE001
-            logger.exception(f"Session {self.friendly_name} raised exception {exc!r}")
+            logger.exception(f"Session {self.display_name} raised exception {exc!r}")
             self.result = Result(
                 self, Status.FAILED, duration=time.perf_counter() - start
             )
@@ -1273,6 +1302,44 @@ def _duration_str(seconds: float, text: str) -> str:
         return ""
 
     return text.format(time=time_str)
+
+
+def _session_venv_backend(session: SessionRunner) -> str | None:
+    """The backend a session will use, without creating the environment."""
+    config = getattr(session, "global_config", None)
+    if config is None:
+        return None
+    return resolve_venv_backends(config, session.func)[0]
+
+
+def _session_python_information(
+    session: SessionRunner,
+) -> tuple[str | None, str | None]:
+    """Return the requested and concrete interpreter for a matrix report."""
+    requested = getattr(session.func, "python", None)
+    if not isinstance(requested, str):
+        requested = getattr(session.func, "call_spec", {}).get("python")
+    if not isinstance(requested, str):
+        requested = None
+
+    concrete: str | None = None
+    venv = getattr(session, "venv", None)
+    if venv is not None:
+        resolved = getattr(venv, "_resolved", None)
+        if isinstance(resolved, str):
+            concrete = resolved
+        elif isinstance(getattr(venv, "interpreter", None), str):
+            concrete = venv.interpreter
+
+    # With backend="none", or before an environment was created, the session
+    # callable is executed by the current Nox interpreter.
+    backend = _session_venv_backend(session)
+    if concrete is None and (requested is None or backend == "none"):
+        concrete = sys.executable
+    elif concrete is None:
+        concrete = requested
+
+    return requested, concrete
 
 
 class Result:
@@ -1312,7 +1379,9 @@ class Result:
             session,
             Status.ABORTED,
             reason=(
-                f"Prerequisite session {dependency.friendly_name} was not successful"
+                "Prerequisite session "
+                f"{getattr(dependency, 'display_name', dependency.friendly_name)}"
+                " was not successful"
             ),
             duration=0,
         )
@@ -1355,15 +1424,35 @@ class Result:
         Returns:
             dict: The serialized result.
         """
-        return {
-            "args": getattr(self.session.func, "call_spec", {}),
-            "name": self.session.name,
+        session = self.session
+        entry = {
+            "args": getattr(session.func, "call_spec", {}),
+            "name": session.name,
             "result": self.status.name.lower(),
             "result_code": self.status.value,
             "reason": self.reason,
-            "signatures": self.session.signatures,
+            "signatures": session.signatures,
             "duration": self.duration,
         }
+        # A filtered matrix cell also records everything needed to confirm that
+        # the identity still names the same configuration: the interpreter, the
+        # backend, the parameters, and the user's short name.
+        selector = getattr(session, "selector", None)
+        if selector is not None:
+            requested_python, interpreter = _session_python_information(session)
+            backend = _session_venv_backend(session)
+            entry["selector"] = selector
+            # Descriptive aliases for report consumers that name the concept
+            # rather than the CLI mechanism.
+            entry["identity"] = selector
+            entry["stable_id"] = selector
+            entry["session"] = getattr(session, "display_name", None)
+            entry["short_name"] = getattr(session, "matrix_short_name", None)
+            entry["python"] = requested_python
+            entry["interpreter"] = interpreter
+            entry["venv_backend"] = backend
+            entry["backend"] = backend
+        return entry
 
     @classmethod
     def from_dict(cls, session: SessionRunner, entry: dict[str, Any]) -> Result:

@@ -175,6 +175,10 @@ class Call(Func):
         )
         self.call_spec = call_spec
         self.session_signature = session_signature
+        # The spec that produced this call. ``call_spec`` drops a ``python``
+        # argument that selected the interpreter, but matrix identities must
+        # still account for it, so keep the untouched spec around.
+        self.param_spec = param_spec
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name={self.name!r}, call_spec={self.call_spec!r}, session_signature={self.session_signature!r})"

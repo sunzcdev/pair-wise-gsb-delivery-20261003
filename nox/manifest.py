@@ -14,7 +14,14 @@
 
 from __future__ import annotations
 
-__lazy_modules__ = {"ast", "itertools", "nox._resolver", "nox.sessions", "operator"}
+__lazy_modules__ = {
+    "ast",
+    "itertools",
+    "nox._parametrize",
+    "nox._resolver",
+    "nox.sessions",
+    "operator",
+}
 
 import ast
 import functools
@@ -24,6 +31,14 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from nox._decorators import Call, Func
+from nox._parametrize import (
+    MatrixError,
+    cell_inputs,
+    format_inputs,
+    matrix_conflicts,
+    matrix_identity,
+    select_cells,
+)
 from nox._resolver import CycleError, lazy_stable_topo_sort
 from nox.sessions import Session, SessionRunner
 
@@ -31,6 +46,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
     from nox._options import NoxConfig
+    from nox._parametrize import Param
 
 __all__ = ["WARN_PYTHONS_IGNORED", "Manifest", "keyword_match"]
 
@@ -76,6 +92,14 @@ class Manifest:
         self._consumed: list[SessionRunner] = []
         self._config: NoxConfig = global_config
         self.module_docstring: str | None = module_docstring
+        # Problems found while building filtered matrices (bad exclude filters,
+        # colliding short names). Collected rather than raised so Nox can name
+        # every one of them before executing anything.
+        self.matrix_problems: list[str] = []
+        # Identities that a matrix filter removed, keyed by selector. Kept so
+        # that asking to run one gives a precise refusal instead of a generic
+        # "not found" (and never silently runs a different, surviving cell).
+        self.excluded_selectors: dict[str, str] = {}
 
         # Create the sessions based on the provided session functions.
         for name, func in session_functions.items():
@@ -87,7 +111,10 @@ class Manifest:
             needle in self._queue
             or needle in self._consumed
             or any(
-                session.name == needle or needle in session.signatures
+                session.name == needle
+                or needle in session.signatures
+                or needle == getattr(session, "selector", None)
+                or needle == getattr(session, "display_name", None)
                 for session in itertools.chain(self._queue, self._consumed)
             )
         )
@@ -97,7 +124,12 @@ class Manifest:
 
     def __getitem__(self, key: str) -> SessionRunner:
         for session in itertools.chain(self._queue, self._consumed):
-            if session.name == key or key in session.signatures:
+            if (
+                session.name == key
+                or key in session.signatures
+                or key == getattr(session, "selector", None)
+                or key == getattr(session, "display_name", None)
+            ):
                 return session
         raise KeyError(key)
 
@@ -186,6 +218,17 @@ class Manifest:
                     itertools.chain(
                         [x.name for x in self._all_sessions if x.name],
                         *[x.signatures for x in self._all_sessions],
+                        [
+                            x.selector
+                            for x in self._all_sessions
+                            if getattr(x, "selector", None) is not None
+                        ],
+                        [
+                            x.display_name
+                            for x in self._all_sessions
+                            if getattr(x, "selector", None) is not None
+                            and x.display_name != x.selector
+                        ],
                     )
                 ),
             )
@@ -196,7 +239,18 @@ class Manifest:
             if _normalize_arg(session_name) not in all_sessions
         ]
         if missing_sessions:
-            msg = f"Sessions not found: {', '.join(missing_sessions)}"
+            msgs = []
+            for session_name in missing_sessions:
+                excluded = self.excluded_selectors.get(session_name)
+                if excluded is not None:
+                    msgs.append(
+                        f"{session_name} was excluded by an 'exclude' filter"
+                        f" ({excluded}); it will not run and is not reassigned to"
+                        " another combination."
+                    )
+                else:
+                    msgs.append(f"Sessions not found: {session_name}")
+            msg = "\n".join(msgs)
             raise KeyError(msg)
 
     def filter_by_default(self) -> None:
@@ -345,10 +399,39 @@ class Manifest:
                 # has no version parametrised, add it as sole occupant to func.python
                 func.python = _unique_list(*extra_pythons)
 
+        matrix_enabled = bool(getattr(func, "matrix_enabled", False))
+
         # If the func has the python attribute set to a list, we'll need
         # to expand them. Duplicates would make identical sessions.
         if isinstance(func.python, (list, tuple, set)):
-            for python in _unique_list(*func.python):
+            pythons = _unique_list(*func.python)
+
+            if matrix_enabled and hasattr(func, "parametrize"):
+                # Filter across every interpreter at once, so one exclude
+                # filter can name the ``python`` axis and a parametrized axis.
+                kept = self._filtered_matrix_cells(name, func, pythons)
+                if kept is None:
+                    return []
+                for python in pythons:
+                    specs = [
+                        spec for spec, cell_python in kept if cell_python == python
+                    ]
+                    if not specs:
+                        continue
+                    single_func = func.copy()
+                    single_func.python = python
+                    sessions.extend(
+                        self._make_parametrized_sessions(
+                            name,
+                            single_func,
+                            specs,
+                            multi=True,
+                            selector_python=python,
+                        )
+                    )
+                return sessions
+
+            for python in pythons:
                 single_func = func.copy()
                 single_func.python = python
                 sessions.extend(self.make_session(name, single_func, multi=True))
@@ -371,7 +454,71 @@ class Manifest:
         # Since this function is parametrized, we need to add a distinct
         # session for each permutation.
         parametrize = func.parametrize
-        calls = Call.generate_calls(func, parametrize)
+        if matrix_enabled:
+            selector_python = func.python if isinstance(func.python, str) else None
+            kept = self._filtered_matrix_cells(name, func, [selector_python])
+            if kept is None:
+                return []
+            parametrize = [spec for spec, _ in kept]
+        else:
+            selector_python = None
+
+        return self._make_parametrized_sessions(
+            name,
+            func,
+            parametrize,
+            multi=multi,
+            selector_python=selector_python,
+        )
+
+    def _filtered_matrix_cells(
+        self, name: str, func: Func, pythons: Sequence[str | None]
+    ) -> list[tuple[Param, str | None]] | None:
+        """Apply this session's ``exclude`` filters over every matrix cell.
+
+        Returns:
+            The surviving ``(param_spec, python)`` cells, in declaration
+            order. Returns ``None`` when the filters are invalid: nothing is
+            created for the session, and the problems are recorded on the
+            manifest instead.
+        """
+        axes = getattr(func, "matrix_axes", ())
+        cells: list[tuple[Param, str | None]] = [
+            (spec, python) for python in pythons for spec in func.parametrize
+        ]
+        try:
+            kept = select_cells(
+                cells, excludes=getattr(func, "matrix_excludes", ()), axis_names=axes
+            )
+        except MatrixError as exc:
+            # Report every bad filter at once, before anything runs.
+            self.matrix_problems.extend(exc.problems)
+            return None
+
+        # Remember what the filters hide, so a request for an excluded identity
+        # is refused by name instead of falling through to a generic error.
+        kept_keys = {(id(spec), python) for spec, python in kept}
+        for spec, python in cells:
+            if (id(spec), python) not in kept_keys:
+                self.excluded_selectors[matrix_identity(name, spec, python)] = (
+                    format_inputs(cell_inputs(spec, python))
+                )
+
+        self.matrix_problems.extend(matrix_conflicts(name, kept))
+        return kept
+
+    def _make_parametrized_sessions(
+        self,
+        name: str,
+        func: Func,
+        param_specs: Iterable[Param],
+        *,
+        multi: bool,
+        selector_python: str | None,
+    ) -> list[SessionRunner]:
+        """Create one session per parameter combination."""
+        calls = Call.generate_calls(func, param_specs)
+        sessions = []
         for call in calls:
             long_names = []
             if not multi or (
@@ -385,8 +532,20 @@ class Manifest:
                 # Ensure that specifying session-python will run all parameterizations.
                 long_names.append(f"{name}-{func.python}")
 
+            selector = None
+            if selector_python is not None or getattr(func, "matrix_enabled", False):
+                selector = matrix_identity(name, call.param_spec, selector_python)
+
             sessions.append(
-                SessionRunner(name, long_names, call, self._config, self, multi=multi)
+                SessionRunner(
+                    name,
+                    long_names,
+                    call,
+                    self._config,
+                    self,
+                    multi=multi,
+                    selector=selector,
+                )
             )
 
         # Edge case: If the parameters made it such that there were no valid
@@ -398,7 +557,6 @@ class Manifest:
                 )
             )
 
-        # Return the list of sessions.
         return sessions
 
     def notify(
@@ -431,7 +589,12 @@ class Manifest:
         # Locate the session in the list of all sessions, and place it at
         # the end of the queue.
         for s in self._all_sessions:
-            if s == session or s.name == session or session in s.signatures:  # noqa: PLR1714
+            if (
+                s == session
+                or s.name == session
+                or session in s.signatures
+                or session == getattr(s, "selector", None)
+            ):
                 if posargs is not None:
                     s.posargs = list(posargs)
                 self._queue.append(s)
@@ -478,7 +641,12 @@ def _null_session_func_(session: Session) -> None:
 
 def _normalized_session_match(session_name: str, session: SessionRunner) -> bool:
     """Checks if session_name matches session."""
-    if session_name == session.name or session_name in session.signatures:
+    if (
+        session_name == session.name
+        or session_name in session.signatures
+        or session_name == getattr(session, "selector", None)
+        or session_name == getattr(session, "display_name", None)
+    ):
         return True
     normalized_name = _normalize_arg(session_name)
     for name in session.signatures:

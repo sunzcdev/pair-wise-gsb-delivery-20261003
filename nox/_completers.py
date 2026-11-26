@@ -93,8 +93,11 @@ def session_completer(
     filtered_manifest = filter_manifest(manifest, config)
     if isinstance(filtered_manifest, int):
         return []
+    # Offer the replayable selector rather than the decorated display label.
+    # Legacy sessions still complete by their friendly name.
     return (
-        session.friendly_name for session, _ in filtered_manifest.list_all_sessions()
+        getattr(session, "selector", None) or session.friendly_name
+        for session, _ in filtered_manifest.list_all_sessions()
     )
 
 

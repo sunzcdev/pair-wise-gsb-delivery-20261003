@@ -125,6 +125,15 @@ Then running ``nox --session tests`` will actually run all parametrized versions
     nox --session "tests(django='1.9')"
     nox --session "tests(django='2.0')"
 
+A session that uses :ref:`exclude= <excluding_combinations>` instead gets a
+stable cell identity, which is accepted by ``--session`` too and keeps naming
+the same configuration even if the axes are declared in a different order or a
+different combination is excluded:
+
+.. code-block:: console
+
+    nox --session "tests[database=postgres,dependency=1.0,python=3.12]"
+
 
 .. _opt-default-venv-backend:
 
@@ -546,6 +555,12 @@ You can output a report in ``json`` format by specifying ``--report``:
 .. code-block:: console
 
     nox --report status.json
+
+For a session that uses :ref:`exclude= <excluding_combinations>`, each entry
+also records the stable ``selector`` of the cell, its ``short_name`` (if the
+user gave one), the selected ``python`` interpreter, and the ``venv_backend``.
+That makes it possible to confirm that an identity captured from a listing
+still ran the same configuration, even after the matrix was edited.
 
 
 Converting from tox

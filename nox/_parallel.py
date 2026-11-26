@@ -337,13 +337,23 @@ class _Node:
 def _session_selector(session: SessionRunner) -> str:
     """Return an unambiguous ``-s`` value selecting exactly this session.
 
-    ``friendly_name`` can be shared by several runners: with ``--force-python``,
-    parametrized sessions for different interpreters all get e.g. ``test(x=1)``
-    as their first signature. The fully-qualified signature (name, interpreter,
-    and parameters, e.g. ``test-3.10(x=1)``) is unique, and is always the
-    longest one a runner has.
+    A filtered matrix cell has a stable identity that is unique by construction
+    and survives axis reordering, so it is preferred whenever it exists.
+    Otherwise, ``friendly_name`` can be shared by several runners: with
+    ``--force-python``, parametrized sessions for different interpreters all get
+    e.g. ``test(x=1)`` as their first signature. The fully-qualified signature
+    (name, interpreter, and parameters, e.g. ``test-3.10(x=1)``) is unique, and
+    is always the longest one a runner has.
     """
+    selector = getattr(session, "selector", None)
+    if selector is not None:
+        return selector
     return max(session.signatures, key=len) if session.signatures else session.name
+
+
+def _display_name(session: SessionRunner) -> str:
+    """The name to show for a running session: identity plus short name."""
+    return getattr(session, "display_name", None) or session.friendly_name
 
 
 def _child_argv(
@@ -534,7 +544,7 @@ def run_manifest_parallel(
     )
 
     def worker(node: _Node) -> Result:
-        name = node.session.friendly_name
+        name = _display_name(node.session)
         reporter.started(name)
         result, output = _run_session(
             node.session,
@@ -581,7 +591,7 @@ def run_manifest_parallel(
                     progressed = True
                     result = Result.aborted_prerequisite(node.session, failed[0])
                     results[node.session] = result
-                    reporter.finished(node.session.friendly_name, result, "")
+                    reporter.finished(_display_name(node.session), result, "")
                 elif (
                     len(futures) < jobs
                     and not exclusive_running

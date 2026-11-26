@@ -359,6 +359,8 @@ If you run ``nox --list``, you'll see that this generates the following set of s
 If you only want to run one of the parametrized sessions, see :ref:`running_paramed_sessions`.
 
 
+.. _giving-friendly-names:
+
 Giving friendly names to parametrized sessions
 ----------------------------------------------
 
@@ -454,6 +456,82 @@ Pythons:
     )
     def tests(session, dependency):
         ...
+
+
+.. _excluding_combinations:
+
+Excluding combinations and stable cell identities
+-------------------------------------------------
+
+Rather than generating the accepted combinations yourself, you can declare the
+full matrix and pass ``exclude=`` to :func:`nox.parametrize`. Each mapping names
+one or more axes; a cell is removed when it matches *all* pairs of any one
+mapping. A predicate callable is also accepted. Alternatively,
+``@nox.parametrize_exclude(...)`` provides the same filter as a separate
+decorator:
+
+.. code-block:: python
+
+    @nox.session
+    @nox.parametrize("database", ["postgres", "sqlite"])
+    @nox.parametrize("dependency", ["1.0", "2.0"])
+    @nox.parametrize(
+        "python",
+        ["3.10", "3.11", "3.12"],
+        exclude=[
+            {"python": "3.10", "dependency": "2.0"},
+            {"python": "3.11", "database": "sqlite"},
+        ],
+    )
+    def tests(session, database, dependency):
+        ...
+
+A filter may span the ``python`` axis and the parametrized axes, and stacked
+``@nox.parametrize`` decorators all contribute to it. Filters are validated when
+the sessions are discovered: a filter naming an unknown axis or matching no
+combination is an error, reported before any session runs, rather than being
+silently ignored.
+
+Supplying ``exclude=`` (even as an empty list) also opts the session into
+**stable cell identities**. Each surviving cell is then selected by the sorted
+``name[axis=value,...]`` form, which depends only on the axis values. Reordering
+the ``@nox.parametrize`` decorators, or excluding a different combination, does
+not change the identity of a cell, so an identity captured from one listing
+keeps selecting the same configuration:
+
+.. code-block:: console
+
+    $ nox --list
+    * tests[database=postgres,dependency=1.0,python=3.12]
+    ...
+
+    $ nox --sessions "tests[database=postgres,dependency=1.0,python=3.12]"
+
+This identity is what ``--sessions``/``-s`` matches, what listings show, and what
+the ``--json`` listing and the ``--report`` file record (as ``selector``), so a
+CI job can select a cell and a later run can be checked against the same cell.
+The interpreter is part of the identity when it is not itself a parametrized
+argument. The report also records the requested ``python``, the concrete
+``interpreter`` used, and the ``venv_backend`` alongside the parameters, so a
+run can be confirmed against the configuration it was meant to execute.
+
+When a cell has a custom ``id`` (see
+:ref:`giving friendly names <giving-friendly-names>`), the listing shows the
+identity with only that user-selected short name appended, e.g.
+``tests[...] [old]``; it is recorded separately as ``short_name``. Two different
+combinations that declare the *same* short name are ambiguous, so Nox reports
+both groups of inputs and exits before running anything. The full
+``identity [short name]`` label is also accepted by ``-s``, while the bracket
+identity alone is the stable CI selector.
+
+An identity that an ``exclude=`` filter removed cannot be run: asking for it is
+an error that says it was excluded, and it will never resolve to a surviving
+combination.
+
+Sessions that configure neither ``exclude=`` nor ``parametrize_exclude`` keep
+the previous selection behavior, and their generated signatures are unchanged.
+Passing ``exclude=[]`` or an empty ``@nox.parametrize_exclude()`` opts into the
+stable identity without removing a cell.
 
 
 Assigning tags to parametrized sessions
