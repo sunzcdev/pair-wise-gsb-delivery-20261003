@@ -155,6 +155,69 @@ def _sed_command(
     return sed_command
 
 
+# Hash tool chains mirroring the ``HashFileFactBase`` facts, in the same
+# fallback order used when comparing local/remote files (sha1, md5, sha256).
+_HASH_TOOL_CHAINS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("sha1", ("sha1sum", "shasum", "sha1")),
+    ("md5", ("md5sum", "md5")),
+    ("sha256", ("sha256sum", "shasum -a 256", "sha256")),
+)
+
+
+def _hash_stdin_command(commands: tuple[str, ...], target: str) -> StringCommand:
+    # Read the file through stdin so checksum tools never see the filename,
+    # matching the facts (see #1911), and normalise "<hash>  -" style output
+    # down to just the hash.
+    bits: list[str | StringCommand] = []
+    for command in commands:
+        if bits:
+            bits.append("||")
+        bits.append(StringCommand(command, "<", QuoteString(target), "2>/dev/null"))
+    return StringCommand("(", *bits, ")", "|", "cut", "-d", "' '", "-f", "1")
+
+
+def verify_checksum(target: str, expected_sums: dict[str, str]) -> StringCommand:
+    """
+    Build a command that succeeds only while ``target`` still has one of the
+    given content checksums (keyed by algorithm: ``sha1``, ``md5``, ``sha256``),
+    failing with a conflict message otherwise. Used to guard attribute changes
+    made after an upload, so a file replaced between the upload and the
+    attribute change is never modified.
+    """
+    bits: list[str | StringCommand] = []
+
+    for algorithm, commands in _HASH_TOOL_CHAINS:
+        expected_sum = expected_sums.get(algorithm)
+        if expected_sum is None:
+            continue
+        if bits:
+            bits.append("||")
+        bits.append(
+            StringCommand(
+                "test",
+                StringCommand('"$(', _hash_stdin_command(commands, target), ')"'),
+                "=",
+                QuoteString(expected_sum),
+            )
+        )
+
+    if not bits:
+        raise OperationError("verify_checksum() requires at least one expected checksum")
+
+    return StringCommand(
+        *bits,
+        "||",
+        "(",
+        "echo",
+        QuoteString(f"pyinfra: {target} changed after upload, not applying attribute changes"),
+        ">&2",
+        ";",
+        "exit 1",
+        ";",
+        ")",
+    )
+
+
 def chmod(target: str, mode: str | int, recursive=False) -> StringCommand:
     args = ["chmod"]
     if recursive:

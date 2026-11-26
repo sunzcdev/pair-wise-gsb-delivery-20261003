@@ -1,0 +1,9 @@
+args:
+- somefile.txt
+- /home/somefile.txt
+kwargs:
+  assume_exists: true
+  verify_upload: true
+exception:
+  name: OperationError
+  message: Cannot use `verify_upload` without a local file to checksum (`assume_exists` is set but the local file does not exist)

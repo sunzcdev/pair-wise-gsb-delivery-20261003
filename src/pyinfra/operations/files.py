@@ -1022,6 +1022,7 @@ def put(
     create_remote_dir=True,
     force=False,
     assume_exists=False,
+    verify_upload=False,
     atime: datetime | float | int | str | bool | None = None,
     mtime: datetime | float | int | str | bool | None = None,
 ):
@@ -1037,6 +1038,7 @@ def put(
     + create_remote_dir: create the remote directory if it doesn't exist
     + force: always upload the file, even if the remote copy matches
     + assume_exists: whether to assume the local file exists
+    + verify_upload: checksum the remote file again before applying attribute changes
     + atime: value of atime the file should have, use ``True`` to match the local file
     + mtime: value of mtime the file should have, use ``True`` to match the local file
 
@@ -1055,6 +1057,15 @@ def put(
         If the remote directory does not exist it will be created using the same
         user & group as passed to ``files.put``. The mode will *not* be copied over,
         if this is required call ``files.directory`` separately.
+
+    ``verify_upload``:
+        When enabled, the attribute changes (``user``/``group``/``mode``/``atime``/
+        ``mtime``) applied after an upload are each guarded by a checksum check:
+        the change only runs while the remote file still matches the content just
+        uploaded. If the file is replaced between the upload and the attribute
+        change, the change is *not* applied to the replacement file and the
+        operation fails with a conflict error instead. Runs where the remote file
+        already matches are unaffected and remain no-ops.
 
     ``atime`` and ``mtime``:
         When set to values other than ``False`` or ``None``, the respective metadata
@@ -1136,6 +1147,19 @@ def put(
     else:
         mode = ensure_mode_int(mode)
 
+    upload_sums: dict[str, str] | None = None
+    if verify_upload:
+        if local_sum_path is None:
+            raise OperationError(
+                "Cannot use `verify_upload` without a local file to checksum "
+                "(`assume_exists` is set but the local file does not exist)",
+            )
+        upload_sums = {
+            "sha1": get_file_sha1(local_sum_path),
+            "md5": get_file_md5(local_sum_path),
+            "sha256": get_file_sha256(local_sum_path),
+        }
+
     remote_file = host.get_fact(File, path=dest)
 
     if not remote_file and (
@@ -1161,6 +1185,14 @@ def put(
     if host.current_op_global_arguments:
         temp_dir = host.current_op_global_arguments.get("_temp_dir")
 
+    def _guard_post_upload(command: StringCommand) -> StringCommand:
+        # Only apply attribute changes while the remote file still matches the
+        # content just uploaded: if it was replaced in between, fail with a
+        # conflict rather than modify the replacement file.
+        if upload_sums is None:
+            return command
+        return StringCommand(file_utils.verify_checksum(dest, upload_sums), "&&", command)
+
     # No remote file, always upload and user/group/mode if supplied
     if not remote_file or force:
         if state.config.DIFF:
@@ -1183,24 +1215,28 @@ def put(
         )
 
         if user or group:
-            yield file_utils.chown(dest, user, group)
+            yield _guard_post_upload(file_utils.chown(dest, user, group))
 
         if mode:
-            yield file_utils.chmod(dest, mode)
+            yield _guard_post_upload(file_utils.chmod(dest, mode))
 
         # do mtime before atime to ensure atime setting isn't undone by mtime setting
         if mtime:
-            yield file_utils.touch(
-                dest,
-                MetadataTimeField.MTIME,
-                _canonicalize_timespec(MetadataTimeField.MTIME, src, mtime),
+            yield _guard_post_upload(
+                file_utils.touch(
+                    dest,
+                    MetadataTimeField.MTIME,
+                    _canonicalize_timespec(MetadataTimeField.MTIME, src, mtime),
+                )
             )
 
         if atime:
-            yield file_utils.touch(
-                dest,
-                MetadataTimeField.ATIME,
-                _canonicalize_timespec(MetadataTimeField.ATIME, src, atime),
+            yield _guard_post_upload(
+                file_utils.touch(
+                    dest,
+                    MetadataTimeField.ATIME,
+                    _canonicalize_timespec(MetadataTimeField.ATIME, src, atime),
+                )
             )
 
     # File exists, check sum and check user/group/mode/atime/mtime if supplied
@@ -1234,23 +1270,27 @@ def put(
             )
 
             if user or group:
-                yield file_utils.chown(dest, user, group)
+                yield _guard_post_upload(file_utils.chown(dest, user, group))
 
             if mode:
-                yield file_utils.chmod(dest, mode)
+                yield _guard_post_upload(file_utils.chmod(dest, mode))
 
             if mtime:
-                yield file_utils.touch(
-                    dest,
-                    MetadataTimeField.MTIME,
-                    _canonicalize_timespec(MetadataTimeField.MTIME, src, mtime),
+                yield _guard_post_upload(
+                    file_utils.touch(
+                        dest,
+                        MetadataTimeField.MTIME,
+                        _canonicalize_timespec(MetadataTimeField.MTIME, src, mtime),
+                    )
                 )
 
             if atime:
-                yield file_utils.touch(
-                    dest,
-                    MetadataTimeField.ATIME,
-                    _canonicalize_timespec(MetadataTimeField.ATIME, src, atime),
+                yield _guard_post_upload(
+                    file_utils.touch(
+                        dest,
+                        MetadataTimeField.ATIME,
+                        _canonicalize_timespec(MetadataTimeField.ATIME, src, atime),
+                    )
                 )
 
         else:
