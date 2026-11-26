@@ -4,7 +4,7 @@ module SolidQueue
   class Dispatcher < Processes::Poller
     include LifecycleHooks
 
-    attr_reader :batch_size
+    attr_reader :batch_size, :scan_limit
 
     after_boot :run_start_hooks
     after_boot :start_maintenance
@@ -16,6 +16,9 @@ module SolidQueue
       options = options.dup.with_defaults(SolidQueue::Configuration::DISPATCHER_DEFAULTS)
 
       @batch_size = options[:batch_size]
+      # Optional hard upper bound on due scheduled executions scanned per poll
+      # while filling the ready batch. nil lets ScheduledExecution derive one.
+      @scan_limit = options[:scan_limit]
 
       # Run both maintenance routines on one timer instead of another thread.
       if options[:concurrency_maintenance] || options[:batch_maintenance]
@@ -41,7 +44,7 @@ module SolidQueue
 
       def dispatch_next_batch
         with_polling_volume do
-          ScheduledExecution.dispatch_next_batch(batch_size)
+          ScheduledExecution.dispatch_next_batch(batch_size, scan_limit: scan_limit)
         end
       end
 
