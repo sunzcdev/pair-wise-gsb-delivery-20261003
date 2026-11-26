@@ -5,6 +5,7 @@ import gc
 import importlib
 import itertools
 import logging
+import math
 import os
 import random
 import sys
@@ -84,6 +85,7 @@ from distributed.worker_state_machine import (
     ComputeTaskEvent,
     ExecuteFailureEvent,
     ExecuteSuccessEvent,
+    FreeKeysEvent,
     RemoveReplicasEvent,
 )
 
@@ -3751,3 +3753,63 @@ async def test_suppress_compute_failure_for_cancelled_tasks(c, s, a):
         await async_poll_for(lambda: not a.state.tasks)
 
     assert not log.getvalue()
+
+
+@gen_cluster(
+    client=True,
+    nthreads=[("127.0.0.1", 1)] * 2,
+    config={
+        "distributed.worker.transfer.dependency-receive-bytes-limit": "1kB",
+    },
+)
+async def test_dependency_receive_budget_config_wiring(c, s, a, b):
+    # The configuration key is picked up by the Worker and forwarded to its
+    # WorkerState, where it bounds in-flight plus resident dependency bytes.
+    assert a.state.dependency_receive_bytes_limit == 1000
+    assert b.state.dependency_receive_bytes_limit == 1000
+
+    np = pytest.importorskip("numpy")
+
+    # Scatter a chunk on b, then pull it into a by depending on it from a task
+    # pinned to a. The fetch must still make progress and settle into memory.
+    payload = await c.scatter(np.ones(128, dtype="u1"), workers=[b.address])
+    out = c.submit(
+        lambda x: int(x.sum()), payload, key="consumer", workers=[a.address]
+    )
+    assert await out == 128
+
+    # Once the transfer has completed, nothing is in flight anymore...
+    assert a.state.transfer_incoming_bytes == 0
+    # ...and the fetched dependency is charged against the receive budget at its
+    # actual size while it remains resident as a replica.
+    dep = a.state.tasks[payload.key]
+    assert dep.received_via_transfer
+    assert a.state.dependency_receive_bytes == 128
+    assert a.state.dependency_receive_bytes_total == 128
+
+    # Releasing the replica refunds the budget exactly once.
+    a.state.handle_stimulus(
+        FreeKeysEvent(keys=[payload.key], stimulus_id="test-release")
+    )
+    await async_poll_for(lambda: a.state.dependency_receive_bytes == 0)
+    assert a.state.dependency_receive_bytes_total == 0
+
+
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 1)] * 2)
+async def test_dependency_receive_budget_disabled_by_default(c, s, a, b):
+    # With no explicit configuration, the budget is disabled and only the classic
+    # in-flight transfer throttling applies.
+    assert a.state.dependency_receive_bytes_limit == math.inf
+    assert a.state.dependency_receive_bytes == 0
+
+    np = pytest.importorskip("numpy")
+    payload = await c.scatter(np.ones(64, dtype="u1"), workers=[b.address])
+    out = c.submit(
+        lambda x: int(x.sum()), payload, key="consumer", workers=[a.address]
+    )
+    await wait(out)
+
+    # Disabled budget: nothing is ever charged as a resident dependency.
+    assert a.state.dependency_receive_bytes == 0
+    assert a.state.transfer_incoming_bytes == 0
+    assert not any(ts.received_via_transfer for ts in a.state.tasks.values())

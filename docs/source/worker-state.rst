@@ -107,6 +107,30 @@ and bandwidth suffers, too much data and responsiveness suffers. We use a fixed 
 acquired from the configuration key ``distributed.worker.connections.outgoing``) so as
 to avoid overly-fragmenting our network bandwidth.
 
+In addition to throttling open transfers, a worker can be configured with an optional
+*dependency receive budget*
+(``distributed.worker.transfer.dependency-receive-bytes-limit``, exposed as
+:attr:`~WorkerState.dependency_receive_bytes_limit`). When enabled, fetching is capped by
+the combined occupancy of:
+
+- :attr:`~WorkerState.transfer_incoming_bytes`, the *estimated* bytes of transfers
+  currently in flight, and
+- :attr:`~WorkerState.dependency_receive_bytes`, the *actual* bytes of dependencies that
+  have already been received from peer workers and are still resident in memory because
+  at least one task still references them.
+
+A dependency shared by several tasks is counted only once. The combined occupancy is
+exposed through :attr:`~WorkerState.dependency_receive_bytes_total`. When the budget is
+left at its default of ``false`` it is disabled and only the in-flight transfer
+throttling applies.
+
+A single object larger than the budget is never blocked forever: once the budget is
+otherwise idle, the top-priority object may take it over exclusively, even if it exceeds
+the cap, and it is not fetched in parallel with anything else. The estimate used while an
+object is in flight may differ from its actual size; when the transfer completes the
+budget is settled against the actual resident bytes, and the same amount is refunded when
+the dependency is eventually released.
+
 In the event that the network comms between two workers are saturated, a dependency task
 may cycle between ``fetch`` and ``flight`` until it is successfully collected. It may
 also happen that a peer worker responds that it doesn't have a replica of the requested

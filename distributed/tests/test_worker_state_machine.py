@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import math
 import pickle
 from collections import defaultdict
 from collections.abc import Iterator
@@ -1590,6 +1591,284 @@ def test_throttle_on_transfer_bytes_regardless_of_threshold(ws):
     )
     assert ws.tasks["c"].state == "fetch"
     assert ws.transfer_incoming_bytes == 1
+
+
+def test_dependency_receive_budget_disabled_by_default(ws):
+    # The dependency receive budget is opt-in; when disabled the counters stay at
+    # zero and only the classic in-flight transfer throttling is active.
+    assert ws.dependency_receive_bytes_limit == math.inf
+    assert ws.dependency_receive_bytes == 0
+    assert ws.dependency_receive_bytes_in_flight == 0
+    assert ws.dependency_receive_bytes_total == 0
+
+    ws2 = "127.0.0.1:2"
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "y", who_has={"x": [ws2]}, nbytes={"x": 10}, stimulus_id="s1"
+        )
+    )
+    assert ws.tasks["x"].state == "flight"
+    assert ws.transfer_incoming_bytes == 10
+    # No resident accounting while the budget is disabled.
+    assert ws.dependency_receive_bytes == 0
+    assert ws.dependency_receive_bytes_total == 10
+
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2, data={"x": "x"}, total_nbytes=10, stimulus_id="s2"
+        )
+    )
+    assert ws.tasks["x"].state == "memory"
+    assert ws.dependency_receive_bytes == 0
+    assert not ws.tasks["x"].received_via_transfer
+
+
+def test_dependency_receive_budget_shared_dependency_counted_once(ws):
+    # Two tasks share the same dependency; it must be counted against the budget
+    # only once while both tasks still reference it.
+    ws.dependency_receive_bytes_limit = 100
+    ws2 = "127.0.0.1:2"
+
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "y1", who_has={"x": [ws2]}, nbytes={"x": 10}, stimulus_id="s1"
+        )
+    )
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "y2", who_has={"x": [ws2]}, nbytes={"x": 10}, stimulus_id="s2"
+        )
+    )
+    # Only one GatherDep for the single shared dependency.
+    assert ws.transfer_incoming_bytes == 10
+    assert ws.dependency_receive_bytes == 0
+    assert ws.dependency_receive_bytes_total == 10
+
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2, data={"x": "x" * 10}, total_nbytes=10, stimulus_id="s3"
+        )
+    )
+    x = ws.tasks["x"]
+    assert x.state == "memory"
+    assert x.received_via_transfer
+    # Resident bytes are charged once, regardless of the number of dependents.
+    assert ws.dependency_receive_bytes == x.nbytes
+    assert ws.dependency_receive_bytes_total == x.nbytes
+
+    # Forget the two compute tasks; while either of them still references x, the
+    # dependency stays resident and keeps consuming the budget.
+    ws.handle_stimulus(FreeKeysEvent(keys=["y1"], stimulus_id="s4"))
+    assert x.state == "memory"
+    assert ws.dependency_receive_bytes == x.nbytes
+
+    # A fresh, otherwise unreferenced fetch of x still resolves to the same
+    # resident object and must not double-charge the budget.
+    ws.handle_stimulus(
+        AcquireReplicasEvent(who_has={"x": [ws2]}, nbytes={"x": 10}, stimulus_id="s5")
+    )
+    assert ws.tasks["x"] is x
+    assert ws.dependency_receive_bytes == x.nbytes
+
+    # Releasing the last reference frees the dependency and its budget, exactly
+    # once. The task record may linger in "released" state while the compute tasks
+    # are still being torn down, but its data is gone and the budget is refunded.
+    ws.handle_stimulus(FreeKeysEvent(keys=["x"], stimulus_id="s6"))
+    assert x.state == "released"
+    assert x.key not in ws.data
+    assert not x.received_via_transfer
+    assert ws.dependency_receive_bytes == 0
+    assert ws.dependency_receive_bytes_total == 0
+
+
+def test_dependency_receive_budget_blocks_until_reference_released(ws):
+    # A large object close to the budget can only start once a smaller, shared
+    # dependency has been fully released. Until then it stays in fetch state.
+    ws.dependency_receive_bytes_limit = 100
+    ws2 = "127.0.0.1:2"
+
+    # Two tasks share a small dependency of 10 estimated bytes.
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "y1", who_has={"x": [ws2]}, nbytes={"x": 10}, stimulus_id="s1"
+        )
+    )
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "y2", who_has={"x": [ws2]}, nbytes={"x": 10}, stimulus_id="s2"
+        )
+    )
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2, data={"x": "x" * 10}, total_nbytes=10, stimulus_id="s3"
+        )
+    )
+    x = ws.tasks["x"]
+    assert x.state == "memory"
+    assert ws.dependency_receive_bytes == x.nbytes
+
+    # A large object of 95 estimated bytes would fit on its own (95 <= 100), but
+    # not alongside the resident small dependency. It must remain in fetch.
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "z", who_has={"big": [ws2]}, nbytes={"big": 95}, stimulus_id="s4"
+        )
+    )
+    big = ws.tasks["big"]
+    assert big.state == "fetch"
+    assert ws.transfer_incoming_bytes == 0
+    assert ws.dependency_receive_bytes == x.nbytes
+    assert ws.dependency_receive_bytes_total == x.nbytes
+
+    # Releasing one of the two references is not enough.
+    ws.handle_stimulus(FreeKeysEvent(keys=["y1"], stimulus_id="s5"))
+    assert big.state == "fetch"
+    assert ws.dependency_receive_bytes == x.nbytes
+
+    # Once the last reference is released, the budget frees up and the large
+    # object can finally start gathering.
+    ws.handle_stimulus(FreeKeysEvent(keys=["x"], stimulus_id="s6"))
+    assert x.state == "released"
+    assert x.key not in ws.data
+    assert ws.dependency_receive_bytes == 0
+    assert big.state == "flight"
+    assert ws.transfer_incoming_bytes == 95
+    assert ws.dependency_receive_bytes_total == 95
+
+
+def test_dependency_receive_budget_oversized_object_takes_budget_exclusively(ws):
+    # A single object larger than the budget must still be fetchable, but only
+    # when nothing else occupies the budget; it must not run in parallel with any
+    # other fetch.
+    ws.dependency_receive_bytes_limit = 100
+    ws2 = "127.0.0.1:2"
+    ws3 = "127.0.0.1:3"
+
+    # A resident dependency fills part of the budget.
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "y", who_has={"x": [ws2]}, nbytes={"x": 40}, stimulus_id="s1"
+        )
+    )
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2, data={"x": "x" * 40}, total_nbytes=40, stimulus_id="s2"
+        )
+    )
+    assert ws.dependency_receive_bytes == ws.tasks["x"].nbytes
+
+    # The oversized object is blocked while the budget is occupied...
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "z", who_has={"big": [ws3]}, nbytes={"big": 200}, stimulus_id="s3"
+        )
+    )
+    assert ws.tasks["big"].state == "fetch"
+
+    # ...but once the budget is idle, the oversized object may take it over
+    # exclusively despite exceeding the cap, ensuring progress.
+    ws.handle_stimulus(FreeKeysEvent(keys=["x"], stimulus_id="s4"))
+    assert ws.tasks["x"].state == "released"
+    assert "x" not in ws.data
+    assert ws.dependency_receive_bytes == 0
+    assert ws.tasks["big"].state == "flight"
+    assert ws.transfer_incoming_bytes == 200
+
+
+def test_dependency_receive_budget_busy_retry_settles_once_with_actual_size(ws):
+    # Full scenario: a large fetch near the budget is rejected as busy once, then
+    # retried normally. The actual received size differs from the estimate. Each
+    # of release, retry, and actual residency must be settled exactly once.
+    ws.dependency_receive_bytes_limit = 100
+    ws2 = "127.0.0.1:2"
+
+    # The large object is the only thing around, so it can take the budget even
+    # though it is close to the cap.
+    instructions = ws.handle_stimulus(
+        ComputeTaskEvent.dummy(
+            "z", who_has={"big": [ws2]}, nbytes={"big": 95}, stimulus_id="s1"
+        )
+    )
+    assert instructions == [
+        GatherDep(worker=ws2, to_gather={"big"}, total_nbytes=95, stimulus_id="s1")
+    ]
+    big = ws.tasks["big"]
+    assert big.state == "flight"
+    # Estimated in-flight reservation.
+    assert ws.transfer_incoming_bytes == 95
+    assert ws.dependency_receive_bytes == 0
+    assert ws.transfer_incoming_count_total == 1
+
+    # First attempt comes back busy: the in-flight reservation is released and
+    # the task goes back to fetch. No resident charge must occur.
+    instructions = ws.handle_stimulus(
+        GatherDepBusyEvent(worker=ws2, total_nbytes=95, stimulus_id="s2")
+    )
+    assert instructions == [
+        RetryBusyWorkerLater(worker=ws2, stimulus_id="s2"),
+        RequestRefreshWhoHasMsg(keys=["big"], stimulus_id="s2"),
+    ]
+    assert big.state == "fetch"
+    assert ws.transfer_incoming_bytes == 0
+    assert ws.dependency_receive_bytes == 0
+    assert ws.dependency_receive_bytes_total == 0
+
+    # Retry once the peer is available again: a second GatherDep is issued and
+    # the in-flight reservation is re-established (still a single logical object).
+    instructions = ws.handle_stimulus(
+        RetryBusyWorkerEvent(worker=ws2, stimulus_id="s3")
+    )
+    assert instructions == [
+        GatherDep(worker=ws2, to_gather={"big"}, total_nbytes=95, stimulus_id="s3")
+    ]
+    assert big.state == "flight"
+    assert ws.transfer_incoming_bytes == 95
+    assert ws.transfer_incoming_count_total == 2
+
+    # The actual value is larger than the estimate (95 -> 110). On success the
+    # in-flight reservation is swapped for a single resident charge at the actual
+    # size, even though the value exceeded the cap.
+    actual = "b" * 110
+    actual_nbytes = sizeof(actual)
+    ws.handle_stimulus(
+        GatherDepSuccessEvent(
+            worker=ws2, data={"big": actual}, total_nbytes=95, stimulus_id="s4"
+        )
+    )
+    assert big.state == "memory"
+    assert big.received_via_transfer
+    assert big.nbytes == actual_nbytes
+    assert ws.transfer_incoming_bytes == 0
+    # Residency settled exactly once, at the actual size.
+    assert ws.dependency_receive_bytes == actual_nbytes
+    assert ws.dependency_receive_bytes_total == actual_nbytes
+
+    # Releasing the dependency refunds the actual resident bytes exactly once.
+    ws.handle_stimulus(FreeKeysEvent(keys=["big"], stimulus_id="s5"))
+    assert big.state == "released"
+    assert big.key not in ws.data
+    assert not big.received_via_transfer
+    assert ws.dependency_receive_bytes == 0
+    assert ws.dependency_receive_bytes_total == 0
+    assert ws.transfer_incoming_bytes == 0
+
+
+def test_dependency_receive_budget_does_not_count_scatter_or_compute(ws):
+    # Locally computed and scattered data never go through gather_dep and so must
+    # not consume the dependency receive budget.
+    ws.dependency_receive_bytes_limit = 100
+
+    ws.handle_stimulus(
+        ComputeTaskEvent.dummy("x", stimulus_id="s1"),
+        ExecuteSuccessEvent.dummy("x", value="x", nbytes=60, stimulus_id="s2"),
+    )
+    assert ws.tasks["x"].state == "memory"
+    assert ws.dependency_receive_bytes == 0
+
+    ws.handle_stimulus(UpdateDataEvent(data={"s": "s" * 60}, stimulus_id="s3"))
+    assert ws.tasks["s"].state == "memory"
+    assert ws.dependency_receive_bytes == 0
+    assert ws.dependency_receive_bytes_total == 0
 
 
 def test_worker_nbytes(ws_with_running_task):

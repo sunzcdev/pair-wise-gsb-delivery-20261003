@@ -91,6 +91,12 @@ distributed:
     use-file-locking: True
     transfer:
       message-bytes-limit: 50MB
+      # Optional cap on the combined estimated bytes of in-flight incoming
+      # transfers and the actual bytes of dependencies already received from peer
+      # workers and not yet released. A dependency shared by multiple tasks is
+      # counted only once. Set to false to disable and rely solely on the
+      # in-flight throttling of distributed.worker.memory.transfer.
+      dependency-receive-bytes-limit: false
     connections:            # Maximum concurrent connections for data
       outgoing: 50          # This helps to control network saturation
       incoming: 10

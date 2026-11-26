@@ -753,6 +753,14 @@ class Worker(BaseWorker, ServerNode):
             transfer_incoming_bytes_limit = int(
                 self.memory_manager.memory_limit * transfer_incoming_bytes_fraction
             )
+
+        dependency_receive_bytes_limit = math.inf
+        dependency_receive_budget = dask.config.get(
+            "distributed.worker.transfer.dependency-receive-bytes-limit"
+        )
+        if dependency_receive_budget is not False:
+            dependency_receive_bytes_limit = parse_bytes(dependency_receive_budget)
+
         state = WorkerStateClass(
             nthreads=nthreads,
             data=self.memory_manager.data,
@@ -764,6 +772,7 @@ class Worker(BaseWorker, ServerNode):
             transition_counter_max=transition_counter_max,
             transfer_incoming_bytes_limit=transfer_incoming_bytes_limit,
             transfer_message_bytes_limit=transfer_message_bytes_limit,
+            dependency_receive_bytes_limit=dependency_receive_bytes_limit,
         )
         BaseWorker.__init__(self, state)
 
@@ -977,6 +986,10 @@ class Worker(BaseWorker, ServerNode):
                 "incoming_bytes": self.state.transfer_incoming_bytes,
                 "incoming_count": self.state.transfer_incoming_count,
                 "incoming_count_total": self.state.transfer_incoming_count_total,
+                "dependency_receive_bytes": self.state.dependency_receive_bytes,
+                "dependency_receive_bytes_total": (
+                    self.state.dependency_receive_bytes_total
+                ),
                 "outgoing_bytes": self.transfer_outgoing_bytes,
                 "outgoing_count": self.transfer_outgoing_count,
                 "outgoing_count_total": self.transfer_outgoing_count_total,

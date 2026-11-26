@@ -382,6 +382,26 @@ properties:
                   the task will still be gathered to ensure progress. Hence, this limit is not absolute.
                   Note that this limit applies to a single gather operation and a worker may gather data from
                   multiple workers in parallel.
+              dependency-receive-bytes-limit:
+                oneOf:
+                  - type:
+                      - string
+                      - integer
+                    minimum: 0
+                  - enum: [false]
+                description: |
+                  Optional cap on the total number of bytes that a worker is expected to
+                  receive from peer workers and still hold locally. When set, fetching is
+                  throttled based on the sum of the estimated bytes of open incoming
+                  transfers and the actual bytes of dependencies already received and not
+                  yet released. A dependency shared by multiple tasks is counted only once.
+
+                  A single object larger than the cap can still be fetched when the budget
+                  is otherwise idle, in which case it is allowed to take over the whole
+                  budget exclusively and is not fetched in parallel with anything else.
+
+                  Set to false to disable the budget and rely solely on the in-flight
+                  transfer throttling of distributed.worker.memory.transfer.
           connections:
             type: object
             description: |

@@ -266,6 +266,12 @@ class TaskState:
     metadata: dict = field(default_factory=dict)
     #: The size of the value of the task, if in memory
     nbytes: int | None = None
+    #: True if the data currently in memory (or in flight) was fetched from a peer
+    #: worker via ``gather_dep``, as opposed to being computed locally or received
+    #: via ``scatter()``. Such tasks count towards
+    #: :attr:`WorkerState.dependency_receive_bytes` while they are in flight or
+    #: resident in memory.
+    received_via_transfer: bool = False
     #: Arbitrary task annotations
     annotations: dict | None = None
     #: unique span id (see ``distributed.spans``).
@@ -1165,6 +1171,22 @@ class WorkerState:
     #: less than this value.
     transfer_incoming_bytes_throttle_threshold: int
 
+    #: Optional cap on the total number of bytes that this worker is expected to
+    #: receive from peer workers and still hold locally. When set, fetching is
+    #: throttled based on the sum of :attr:`transfer_incoming_bytes` (estimated
+    #: bytes of open transfers) and :attr:`dependency_receive_bytes` (actual bytes
+    #: of dependencies already received and not yet released). A single dependency
+    #: shared by multiple tasks is counted only once. When ``math.inf`` (the
+    #: default), this budget is disabled and only the transfer throttling based on
+    #: :attr:`transfer_incoming_bytes_limit` is in effect.
+    dependency_receive_bytes_limit: float
+
+    #: Actual total size in bytes of the dependencies that have been fetched from
+    #: peer workers via ``gather_dep`` and are currently resident in memory (that
+    #: is, in :attr:`data` or :attr:`actors`) without having been released yet.
+    #: A dependency shared by multiple tasks is counted only once.
+    dependency_receive_bytes: int
+
     #: Peer workers that recently returned a busy status. Workers in this set won't be
     #: asked for additional dependencies for some time.
     busy_workers: set[str]
@@ -1264,6 +1286,7 @@ class WorkerState:
         transition_counter_max: int | Literal[False] = False,
         transfer_incoming_bytes_limit: float = math.inf,
         transfer_message_bytes_limit: float = math.inf,
+        dependency_receive_bytes_limit: float = math.inf,
     ):
         self.nthreads = nthreads
 
@@ -1295,6 +1318,8 @@ class WorkerState:
         self.transfer_incoming_count_total = 0
         self.transfer_incoming_bytes_throttle_threshold = int(10e6)
         self.transfer_incoming_bytes = 0
+        self.dependency_receive_bytes_limit = dependency_receive_bytes_limit
+        self.dependency_receive_bytes = 0
         self.missing_dep_flight = set()
         self.generation = 0
         self.ready = HeapSet(key=operator.attrgetter("priority"))
@@ -1391,6 +1416,30 @@ class WorkerState:
         """
         return len(self.in_flight_workers)
 
+    @property
+    def dependency_receive_bytes_in_flight(self) -> int:
+        """Estimated bytes of dependencies for which the peer-to-peer transfer has
+        been started but has not terminated yet.
+
+        This is an alias of :attr:`transfer_incoming_bytes`; it is the in-flight
+        component of :attr:`dependency_receive_bytes_limit`.
+        """
+        return self.transfer_incoming_bytes
+
+    @property
+    def dependency_receive_bytes_total(self) -> int:
+        """Bytes currently charged against :attr:`dependency_receive_bytes_limit`.
+
+        This is the sum of:
+
+        - :attr:`transfer_incoming_bytes`: estimated bytes of open transfers, and
+        - :attr:`dependency_receive_bytes`: actual bytes of dependencies already
+          received and still resident in memory.
+
+        A dependency shared by multiple tasks is counted only once.
+        """
+        return self.transfer_incoming_bytes + self.dependency_receive_bytes
+
     #########################
     # Shared helper methods #
     #########################
@@ -1477,6 +1526,7 @@ class WorkerState:
 
         ts.waiting_for_data.clear()
         ts.nbytes = None
+        ts.received_via_transfer = False
         ts.previous = None
         ts.next = None
         ts.done = False
@@ -1502,6 +1552,9 @@ class WorkerState:
         * True if the number of incoming data transfers reached its limit
         and the size of incoming data transfers reached the minimum threshold for throttling
         * True if the size of incoming data transfers reached its limit
+        * True if the optional dependency receive budget
+          (:attr:`dependency_receive_bytes_limit`) is enabled and the combined
+          estimated in-flight bytes and resident dependency bytes reached it
         * False otherwise
         """
         reached_count_limit = (
@@ -1514,7 +1567,16 @@ class WorkerState:
         reached_bytes_limit = (
             self.transfer_incoming_bytes >= self.transfer_incoming_bytes_limit
         )
-        return reached_count_limit and reached_throttle_threshold or reached_bytes_limit
+        reached_dependency_budget = (
+            self.dependency_receive_bytes_total
+            >= self.dependency_receive_bytes_limit
+        )
+        return (
+            reached_count_limit
+            and reached_throttle_threshold
+            or reached_bytes_limit
+            or reached_dependency_budget
+        )
 
     def _ensure_communicating(self, *, stimulus_id: str) -> RecsInstrs:
         """Transition tasks from fetch to flight, until there are no more tasks in fetch
@@ -1533,8 +1595,13 @@ class WorkerState:
             to_gather_tasks, message_nbytes = self._select_keys_for_gather(
                 available_tasks
             )
-            # We always load at least one task
-            assert to_gather_tasks or self.transfer_incoming_bytes
+            # We always load at least one task, unless all traffic is blocked by a
+            # limit - either an open transfer is already occupying the transfer
+            # budget, or received dependencies that haven't been released yet are
+            # filling the dependency receive budget.
+            assert to_gather_tasks or (
+                self.transfer_incoming_bytes or self.dependency_receive_bytes
+            )
             # ...but that task might be selected in the previous iteration of the loop
             if not to_gather_tasks:
                 break
@@ -1688,10 +1755,17 @@ class WorkerState:
             True if gathering the task would exceed limits, False otherwise
             (in which case the task can be gathered).
         """
+        # When there is no other traffic, the top-priority task is fetched
+        # regardless of its size to ensure progress. When the dependency receive
+        # budget is enabled, "no traffic" also requires that no received
+        # dependency is still resident, so that an oversized object can take over
+        # the whole budget exclusively once the latter is free.
         if self.transfer_incoming_bytes == 0 and message_nbytes == 0:
-            # When there is no other traffic, the top-priority task is fetched
-            # regardless of its size to ensure progress
-            return False
+            if (
+                self.dependency_receive_bytes_limit == math.inf
+                or self.dependency_receive_bytes == 0
+            ):
+                return False
 
         incoming_bytes_allowance = (
             self.transfer_incoming_bytes_limit - self.transfer_incoming_bytes
@@ -1709,7 +1783,25 @@ class WorkerState:
                 - message_nbytes
             )
 
-        return ts.get_nbytes() > incoming_bytes_allowance
+        if ts.get_nbytes() > incoming_bytes_allowance:
+            return True
+
+        if self.dependency_receive_bytes_limit != math.inf:
+            # The receive budget covers both the estimated in-flight bytes and the
+            # actual bytes of dependencies already received and not yet released.
+            receive_allowance = (
+                self.dependency_receive_bytes_limit
+                - self.dependency_receive_bytes_total
+            )
+            if message_nbytes != 0:
+                receive_allowance = (
+                    min(receive_allowance, self.transfer_message_bytes_limit)
+                    - message_nbytes
+                )
+            if ts.get_nbytes() > receive_allowance:
+                return True
+
+        return False
 
     def _ensure_computing(self) -> RecsInstrs:
         if not self.running:
@@ -1926,6 +2018,12 @@ class WorkerState:
     ) -> RecsInstrs:
         assert ts.nbytes is not None
         self.nbytes -= ts.nbytes
+        if ts.received_via_transfer:
+            # The dependency is no longer resident; release its share of the
+            # dependency receive budget exactly once. A dependency shared by
+            # multiple tasks is released only when its last reference goes away.
+            self.dependency_receive_bytes -= ts.nbytes
+            ts.received_via_transfer = False
         recs, instructions = self._transition_generic_released(
             ts, stimulus_id=stimulus_id
         )
@@ -2187,6 +2285,11 @@ class WorkerState:
         if not ts.done:
             return {}, []
 
+        # A gather_dep may have completed for a task that was cancelled while in
+        # flight and whose output is going to be discarded. Make sure it doesn't
+        # keep pretending it was received via transfer, since it never entered
+        # memory through this path.
+        ts.received_via_transfer = False
         ts.previous = None
         ts.done = False
         return self._transition_generic_released(ts, stimulus_id=stimulus_id)
@@ -2429,10 +2532,32 @@ class WorkerState:
                     {"action": "disk-write", "start": start, "stop": stop}
                 )
 
+        # Only data fetched from a peer worker and arriving through a gather_dep
+        # completion counts against the dependency receive budget, and only when
+        # the budget is enabled. If the flag is set but the task didn't actually
+        # arrive from flight (e.g. a scatter won a race while the transfer was in
+        # flight), ignore and clear it.
+        budget_enabled = self.dependency_receive_bytes_limit != math.inf
+        arriving_from_flight = budget_enabled and ts.received_via_transfer and (
+            ts.state == "flight"
+            or (ts.state == "resumed" and ts.previous == "flight")
+        )
+        if not arriving_from_flight:
+            ts.received_via_transfer = False
+
         ts.state = "memory"
+        actual_nbytes = sizeof(value)
         if ts.nbytes is None:
-            ts.nbytes = sizeof(value)
+            ts.nbytes = actual_nbytes
+        elif ts.received_via_transfer:
+            # The actual size of a received value may differ from the scheduler
+            # estimate. When the dependency receive budget is enabled, remember
+            # the actual size so that releasing the dependency refunds exactly
+            # what was charged; when disabled, preserve the legacy estimate.
+            ts.nbytes = actual_nbytes
         self.nbytes += ts.nbytes
+        if ts.received_via_transfer:
+            self.dependency_receive_bytes += actual_nbytes
         ts.type = type(value)
 
         for dep in ts.dependents:
@@ -2722,6 +2847,11 @@ class WorkerState:
                 self.tasks[key] = ts = TaskState(key)
                 self.task_counter.new_task(ts)
 
+            # Data arriving via scatter() is not fetched from a peer worker, so it
+            # must never be charged against the dependency receive budget. This
+            # also handles the race where a scatter wins while a gather_dep for the
+            # same key is in flight.
+            ts.received_via_transfer = False
             recommendations[ts] = ("memory", value, RUN_ID_SENTINEL)
             self.log.append(
                 (key, "receive-from-scatter", ts.state, ev.stimulus_id, time())
@@ -2933,6 +3063,18 @@ class WorkerState:
         recommendations: Recs = {}
         for ts in self._gather_dep_done_common(ev):
             if ts.key in ev.data:
+                if ts.state == "memory":
+                    # A scatter() won the race while the transfer was in flight and
+                    # the data is already resident. Discard the transferred value;
+                    # it must not be counted as a received dependency.
+                    self.log.append(
+                        (ts.key, "already-in-memory", ev.stimulus_id, time())
+                    )
+                    ts.received_via_transfer = False
+                    continue
+                # Mark this value as received over the network; it will be charged
+                # against the dependency receive budget once it lands in memory.
+                ts.received_via_transfer = True
                 recommendations[ts] = ("memory", ev.data[ts.key], ts.run_id)
             else:
                 self.log.append((ts.key, "missing-dep", ev.stimulus_id, time()))
@@ -3539,6 +3681,18 @@ class WorkerState:
             self.tasks[key].nbytes or 0 for key in chain(self.data, self.actors)
         )
         assert self.nbytes == expect_nbytes, f"{self.nbytes=}; expected {expect_nbytes}"
+
+        expect_receive_bytes = sum(
+            ts.nbytes or 0
+            for ts in self.tasks.values()
+            if ts.received_via_transfer and ts.state == "memory"
+        )
+        assert self.dependency_receive_bytes == expect_receive_bytes, (
+            f"{self.dependency_receive_bytes=}; expected {expect_receive_bytes}"
+        )
+        assert self.dependency_receive_bytes_total == (
+            self.transfer_incoming_bytes + self.dependency_receive_bytes
+        )
 
         for key in self.data:
             assert key in self.tasks, self.story(key)
