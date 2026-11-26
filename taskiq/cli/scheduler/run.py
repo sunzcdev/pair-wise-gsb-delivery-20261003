@@ -12,12 +12,20 @@ from taskiq.abc.schedule_source import ScheduleSource
 from taskiq.cli.scheduler.args import SchedulerArgs
 from taskiq.cli.utils import import_object, import_tasks
 from taskiq.scheduler.scheduled_task import ScheduledTask
-from taskiq.scheduler.scheduler import TaskiqScheduler
+from taskiq.scheduler.scheduler import TaskiqScheduler, get_source_schedules
 
 logger = getLogger(__name__)
 
 
 ScheduleId: TypeAlias = str
+
+#: Moment of a trigger point that can be dispatched once.
+OccurrenceKey: TypeAlias = datetime
+
+#: How long a dispatched trigger point is remembered. It only needs to
+#: outlive the schedule refresh that may move an effective definition
+#: from one source to another, so a few update intervals are enough.
+OCCURRENCE_RETENTION: timedelta = timedelta(minutes=10)
 
 
 def to_tz_aware(time: datetime) -> datetime:
@@ -45,11 +53,7 @@ async def get_schedules(source: ScheduleSource) -> list[ScheduledTask]:
 
     :param source: source to get schedules from.
     """
-    try:
-        return await source.get_schedules()
-    except Exception:
-        logger.exception("Cannot update schedules with source: %s", source)
-        return []
+    return await get_source_schedules(source)
 
 
 async def get_all_schedules(
@@ -58,9 +62,12 @@ async def get_all_schedules(
     """
     Task to update all schedules.
 
-    This function updates all schedules
-    from all sources and returns a list
-    of (source, tasks) pairs.
+    This function updates all schedules from all sources, resolves
+    definitions that share the same `schedule_id` according to the
+    source priorities and returns a list of (source, tasks) pairs.
+
+    Every resolved schedule is reported once, under the source whose
+    definition is effective, so source hooks run for the winning layer.
 
     :param scheduler: current scheduler.
     :return: list of (source, tasks) pairs.
@@ -69,7 +76,7 @@ async def get_all_schedules(
     schedules: list[list[ScheduledTask]] = await asyncio.gather(
         *[get_schedules(source) for source in scheduler.sources],
     )
-    return list(zip(scheduler.sources, schedules, strict=True))
+    return scheduler.resolve_schedules(schedules)
 
 
 class CronValueError(Exception):
@@ -229,9 +236,57 @@ class SchedulerLoop:
         self.interval_tasks_last_run: dict[ScheduleId, datetime] = {}
         self.time_tasks_last_run: dict[ScheduleId, datetime] = {}
 
+        # Trigger point that was already dispatched for a schedule id,
+        # with the moment it was recorded. It survives a definition
+        # moving between sources, and an id that is temporarily hidden
+        # by an explicit cancellation, so an occurrence that was already
+        # sent isn't sent again when a lower priority definition becomes
+        # effective. Entries are dropped by age only, see
+        # `OCCURRENCE_RETENTION`.
+        self.dispatched_occurrences: dict[
+            ScheduleId,
+            tuple[OccurrenceKey, datetime],
+        ] = {}
+
         self.scheduled_tasks: list[tuple[ScheduleSource, list[ScheduledTask]]] = []
         self.scheduled_tasks_updated_at: datetime | None = None
         self._update_schedules_task_future: asyncio.Task[Any] | None = None
+        self._occurrence_retention: timedelta = OCCURRENCE_RETENTION
+
+    def configure_occurrence_retention(self, update_interval: timedelta) -> None:
+        """
+        Keep occurrence records long enough to bridge a schedule refresh.
+
+        A refresh happens at most once per `update_interval`, and the
+        effective definition is already resolved before it's applied.
+        Remembering the dispatched trigger points for a couple of
+        update intervals is enough to survive a definition moving
+        between sources, including a refresh that was already in
+        flight when the definition was sent.
+
+        :param update_interval: configured schedule refresh interval.
+        """
+        self._occurrence_retention = max(
+            OCCURRENCE_RETENTION,
+            update_interval * 2,
+        )
+
+    def _prune_dispatched_occurrences(self, now: datetime) -> None:
+        """
+        Drop occurrence records that are too old to matter.
+
+        A record is only needed to bridge the refresh that moves an
+        effective definition from one source to another.
+
+        :param now: current time.
+        """
+        expired = [
+            id_
+            for id_, (_, recorded_at) in self.dispatched_occurrences.items()
+            if now - recorded_at > self._occurrence_retention
+        ]
+        for id_ in expired:
+            del self.dispatched_occurrences[id_]
 
     def _update_schedules_task_future_callback(self, task_: asyncio.Task[Any]) -> None:
         self.scheduled_tasks = task_.result()
@@ -242,12 +297,17 @@ class SchedulerLoop:
             new_schedules_ids.update({t.schedule_id for t in task_list})
 
         # Deleting irrelevant scheduled tasks so they don't take up memory.
+        # Occurrence records are not tied to the effective definition, so
+        # they are pruned by age instead: a cancelled id may become
+        # visible again after a later refresh and must not be resent.
         for id_ in self.cron_tasks_last_run.keys() - new_schedules_ids:
             del self.cron_tasks_last_run[id_]
         for id_ in self.interval_tasks_last_run.keys() - new_schedules_ids:
             del self.interval_tasks_last_run[id_]
         for id_ in self.time_tasks_last_run.keys() - new_schedules_ids:
             del self.time_tasks_last_run[id_]
+
+        self._prune_dispatched_occurrences(datetime.now(tz=timezone.utc))
 
     async def _update_scheduled_tasks(self) -> None:
         if (
@@ -273,12 +333,103 @@ class SchedulerLoop:
             for task in task_list:
                 if task.cron is not None:
                     self.cron_tasks_last_run[task.schedule_id] = current_minute
+                    occurrence = self._occurrence_key(task, current_minute)
+                    if occurrence is not None:
+                        self.dispatched_occurrences[task.schedule_id] = (
+                            occurrence,
+                            current_minute,
+                        )
+
+    def _occurrence_key(
+        self,
+        task: ScheduledTask,
+        now: datetime,
+    ) -> OccurrenceKey | None:
+        """
+        Identify the trigger point a definition is currently due for.
+
+        The key is the moment of the trigger point itself. It never
+        contains the source that declared the definition or the field
+        used to declare it, so two sources describing the same trigger
+        point for the same `schedule_id` produce the same key. That
+        lets the scheduler recognise an occurrence as already
+        dispatched after the effective definition moved to another
+        source, even if the trigger type changed on the way.
+
+        Cron and `time` definitions are identified by their trigger
+        minute, so a definition switching between those two
+        representations of the same trigger point is still the same
+        occurrence. Interval definitions have no fixed trigger point,
+        so they are keyed by the second they became due.
+
+        :param task: effective definition.
+        :param now: current time.
+        :return: occurrence key or None when there is no trigger to track.
+        """
+        if task.cron is not None:
+            moment = now
+            offset = task.cron_offset
+            try:
+                if isinstance(offset, timedelta):
+                    moment = now + offset
+                elif isinstance(offset, str):
+                    moment = now.astimezone(ZoneInfo(offset))
+            except (ZoneInfoNotFoundError, ModuleNotFoundError):
+                moment = now
+            return moment.replace(second=0, microsecond=0)
+
+        if task.time is not None:
+            return to_tz_aware(task.time).replace(second=0, microsecond=0)
+
+        if task.interval is not None:
+            return now.replace(microsecond=0)
+
+        return None
+
+    def _occurrence_was_dispatched(
+        self,
+        schedule_id: ScheduleId,
+        occurrence: OccurrenceKey,
+    ) -> bool:
+        """
+        Check whether the trigger point was already handled.
+
+        :param schedule_id: id of the schedule.
+        :param occurrence: trigger point to check.
+        :return: True if it was already dispatched.
+        """
+        recorded = self.dispatched_occurrences.get(schedule_id)
+        return recorded is not None and recorded[0] == occurrence
+
+    def _remember_occurrence(
+        self,
+        schedule_id: ScheduleId,
+        occurrence: OccurrenceKey,
+        now: datetime,
+    ) -> None:
+        """
+        Record a trigger point as dispatched.
+
+        :param schedule_id: id of the schedule.
+        :param occurrence: dispatched trigger point.
+        :param now: current time, used for retention.
+        """
+        self.dispatched_occurrences[schedule_id] = (occurrence, now)
 
     def _is_schedule_ready_to_send(
         self,
         task: ScheduledTask,
         now: datetime,
     ) -> bool:
+        occurrence = self._occurrence_key(task, now)
+        if occurrence is not None and self._occurrence_was_dispatched(
+            task.schedule_id,
+            occurrence,
+        ):
+            # This trigger point was already handled. The effective
+            # definition belongs to another source now.
+            return False
+
         is_ready_to_send: bool = False
 
         if not is_ready_to_send and task.cron is not None:
@@ -317,6 +468,9 @@ class SchedulerLoop:
             if is_ready_to_send:
                 self.time_tasks_last_run[task.schedule_id] = now
 
+        if is_ready_to_send and occurrence is not None:
+            self._remember_occurrence(task.schedule_id, occurrence, now)
+
         return is_ready_to_send
 
     async def run(  # noqa: C901
@@ -353,8 +507,10 @@ class SchedulerLoop:
 
         running_schedules: dict[ScheduleId, asyncio.Task[Any]] = {}
 
+        self.configure_occurrence_retention(update_interval)
         self.scheduled_tasks = await get_all_schedules(self.scheduler)
         self.scheduled_tasks_updated_at = datetime.now(tz=timezone.utc)
+        self._prune_dispatched_occurrences(self.scheduled_tasks_updated_at)
 
         if skip_first_run:
             self._mark_cron_tasks_as_already_run()

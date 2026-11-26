@@ -64,16 +64,97 @@ To specify schedules (cron or time-based) in the labels of a task definition, yo
 Sometimes you may want to use multiple sources to assemble a schedule for tasks. The `TaskiqScheduler` can do so.
 But it's not obvious how to merge schedules from different sources.
 
-That's why you can pass a custom merge function to resolve all possible conflicts or if you want to have more
-complex logic aside from sources. For example, filter out some task schedules.
+### Source priority
 
-Currently we have only two default functions to merge tasks. You can find them in the `taskiq.scheduler.merge_functions` module.
+Every source may declare an integer `priority`. When two sources return a schedule
+with the same `schedule_id`, the definition from the source with the highest priority
+is used. Sources with equal priority are resolved in declaration order, so the source
+listed first wins. The default priority is `0`, which makes sources that don't opt in
+behave as a base layer.
+
+```python
+class BaseSource(ScheduleSource):
+    priority = 0
+
+    async def get_schedules(self) -> list[ScheduledTask]:
+        ...
+
+
+class OverrideSource(ScheduleSource):
+    priority = 100
+
+    async def get_schedules(self) -> list[ScheduledTask]:
+        ...
+```
+
+### Missing fields and explicit cancellation
+
+A higher priority definition doesn't have to repeat every field. Fields it leaves
+out are inherited from the lower priority definitions of the same `schedule_id`,
+while the fields it declares win. That makes a small override source possible:
+
+```python
+# The base source provides task_name, args, kwargs and the trigger.
+# This definition only replaces the args for the same schedule id.
+override = ScheduledTask(
+    schedule_id="same-program",
+    partial=True,
+    args=["overridden"],
+)
+```
+
+Omitted constructor fields are treated as missing and inherited. Set
+`partial=True` when a subset definition has been serialized or validated first,
+because serialization materializes default values and would otherwise make
+those defaults look explicit. Without a sparse marker, a complete definition
+must still declare a trigger (`cron`, `time` or `interval`), as before.
+
+A definition that must remove a schedule instead of changing it is an explicit
+cancellation:
+
+```python
+from taskiq import ScheduledTaskCancellation
+
+await overlay_source.add_schedule(
+    ScheduledTaskCancellation(schedule_id="same-program"),
+)
+```
+
+The difference between "the overlay source no longer returns the schedule" and
+"the overlay source cancels the schedule" matters:
+
+- if the overlay source simply stops returning the schedule, the base definition
+  becomes effective again;
+- an explicit cancellation removes the `schedule_id` for the cancelling source and
+  for every source below it, even if they still provide the schedule. Removing the
+  cancellation brings the lower definition back.
+
+### Already dispatched trigger points
+
+The scheduler remembers which trigger point it already sent for a `schedule_id`,
+independently of the source that provided the definition. If an override source
+goes away between two refreshes and the base definition takes over, an occurrence
+that was already dispatched is not sent a second time, even if the trigger changed
+between `cron` and `time` at the same moment. The next trigger point is dispatched
+normally from the now effective definition. An overlapping direct `on_ready`
+call from another source for the same occurrence is ignored as well, while a
+repeated call from the same source remains an explicit retry.
+
+### Custom merge functions
+
+You can still pass a custom merge function to resolve all possible conflicts or if
+you want to have more complex logic aside from sources. For example, filter out some
+task schedules.
+
+Currently we have three default functions to merge tasks. You can find them in the
+`taskiq.scheduler.merge_functions` module.
 
 - `preserve_all` - simply adds new schedules to the old ones.
-- `only_unique` - adds schedule only if it was not added by previous sources.
+- `only_unique` - adds schedule only if its `schedule_id` was not added by previous sources.
+- `only_new` - keeps only the newly discovered schedules.
 
-Every time we update the schedule it gets tasks from the source and executes this function to merge them together.
-
+Every time we update the schedule it gets tasks from the source and executes this
+function to merge them together.
 
 ## Working with timezones
 

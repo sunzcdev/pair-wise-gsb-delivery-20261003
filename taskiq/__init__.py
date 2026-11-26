@@ -33,7 +33,12 @@ from taskiq.middlewares import (
     SmartRetryMiddleware,
 )
 from taskiq.result import TaskiqResult
-from taskiq.scheduler.scheduled_task import ScheduledTask
+from taskiq.scheduler.scheduled_task import (
+    CancelledSchedule,
+    ScheduleCancellation,
+    ScheduledTask,
+    ScheduledTaskCancellation,
+)
 from taskiq.scheduler.scheduler import TaskiqScheduler
 from taskiq.state import TaskiqState
 from taskiq.task import AsyncTaskiqTask
@@ -48,6 +53,7 @@ __all__ = [
     "AsyncTaskiqDecoratedTask",
     "AsyncTaskiqTask",
     "BrokerMessage",
+    "CancelledSchedule",
     "Context",
     "InMemoryBroker",
     "MultiBroker",
@@ -55,8 +61,10 @@ __all__ = [
     "PrometheusMiddleware",
     "ResultGetError",
     "ResultIsReadyError",
+    "ScheduleCancellation",
     "ScheduleSource",
     "ScheduledTask",
+    "ScheduledTaskCancellation",
     "SecurityError",
     "SendTaskError",
     "SimpleRetryMiddleware",

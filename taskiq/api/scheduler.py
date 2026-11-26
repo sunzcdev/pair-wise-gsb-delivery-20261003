@@ -25,8 +25,10 @@ async def run_scheduler_task(
         await source.startup()
     if run_startup:
         await scheduler.startup()
+    # The loop keeps the bookkeeping of already dispatched trigger
+    # points, so it must survive cancellations of `run`.
+    scheduler_loop = SchedulerLoop(scheduler)
     while True:
-        scheduler_loop = SchedulerLoop(scheduler)
         await scheduler_loop.run(
             update_interval=interval,
             loop_interval=loop_interval,

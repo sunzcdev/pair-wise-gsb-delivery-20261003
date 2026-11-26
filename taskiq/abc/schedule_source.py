@@ -8,7 +8,27 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 class ScheduleSource(ABC):
-    """Abstract class for source of scheduled tasks."""
+    """
+    Abstract class for source of scheduled tasks.
+
+    Sources may declare a `priority`. When several sources return a
+    schedule with the same `schedule_id`, the definition of the source
+    with the highest priority wins. Fields that the winning definition
+    leaves out are inherited from the lower priority sources of the same
+    id, while an explicit cancellation removes the id completely.
+
+    Sources with equal priority are resolved in declaration order, the
+    earliest declared source winning. The default priority is the
+    lowest, so sources that don't opt in behave as a base layer.
+    """
+
+    #: Higher values win over lower ones for the same `schedule_id`.
+    priority: int = 0
+
+    def __init__(self, priority: int | None = None) -> None:
+        """Initialize an optional declared source priority."""
+        if priority is not None:
+            self.priority = priority
 
     async def startup(self) -> None:  # noqa: B027
         """Action to execute during startup."""
