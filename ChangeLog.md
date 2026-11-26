@@ -1,6 +1,17 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Dependency-Aware, Explainable Partial Topology Recovery
+
+When a `Bunny::TopologyRecoveryFilter` excludes an exchange, bindings that depend on it are no
+longer issued against a missing broker entity and are instead skipped with an explicit reason
+reported on the new `Bunny::TopologyRecoveryReport` returned by topology recovery. A failure in one
+branch is contained and never prevents an independent branch from being recovered.
+
+Exchanges and queues can now be declared as externally predeclared with
+`Bunny::Session#mark_exchange_as_externally_predeclared` and
+`Bunny::Session#mark_queue_as_externally_predeclared`. Such resources are not re-declared by this
+connection during recovery, even when a filter excludes them, but still satisfy the dependencies of
+the bindings that reference them.
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)

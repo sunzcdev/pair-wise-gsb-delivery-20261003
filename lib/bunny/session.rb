@@ -8,6 +8,7 @@ require "bunny/heartbeat_sender"
 require "bunny/reader_loop"
 require "bunny/topology_registry"
 require "bunny/topology_recovery_filter"
+require "bunny/topology_recovery_report"
 require "bunny/authentication/credentials_encoder"
 require "bunny/authentication/plain_mechanism_encoder"
 require "bunny/authentication/external_mechanism_encoder"
@@ -643,7 +644,7 @@ module Bunny
     # @param [Bunny::Channel] ch Channel whose topology should be recovered
     # @api public
     def recover_channel_topology(ch)
-      filter = Proc.new { |entity| entity.channel == ch }
+      filter = Proc.new { |entity| entity.channel.equal?(ch) }
       recover_topology_with(filter)
     end
 
@@ -938,6 +939,28 @@ module Bunny
       @topology_registry.delete_recorded_exchange_named(name)
     end
 
+    # Declares that the named exchange is created and owned outside of this
+    # connection and is guaranteed to still exist after a reconnection.
+    #
+    # A topology recovery filter may then skip re-declaring this exchange
+    # while bindings that depend on it are still recovered, because the
+    # broker-side dependency is known to be satisfied.
+    #
+    # @param name [String]
+    # @see Bunny::TopologyRegistry#mark_exchange_as_externally_predeclared
+    def mark_exchange_as_externally_predeclared(name)
+      @topology_registry.mark_exchange_as_externally_predeclared(name)
+    end
+
+    # Declares that the named queue is created and owned outside of this
+    # connection and is guaranteed to still exist after a reconnection.
+    #
+    # @param name [String]
+    # @see Bunny::TopologyRegistry#mark_queue_as_externally_predeclared
+    def mark_queue_as_externally_predeclared(name)
+      @topology_registry.mark_queue_as_externally_predeclared(name)
+    end
+
     # @param [Bunny::Channel] ch
     # @param [String] exchange_name
     # @param [String] queue_name
@@ -1111,65 +1134,226 @@ module Bunny
       recover_topology_with
     end
 
+    # Performs a single, dependency-aware topology recovery pass.
+    #
+    # Entities filtered out by the configured {Bunny::TopologyRecoveryFilter}
+    # are not declared by this connection and are reported as
+    # {TopologyRecoveryReport::FILTERED_OUT}. Dependent entities are then
+    # resolved against the entities that *will* exist on the broker after the
+    # pass: those recovered here, pre-defined broker entities (amq.* and the
+    # default exchange) and entities explicitly marked as externally
+    # predeclared. A binding whose source or destination cannot be satisfied
+    # is skipped with an explanatory reason rather than issued against a
+    # missing entity, and a failure in one branch never prevents the other
+    # branches from being recovered.
+    #
+    # @param filter [#call, nil] an optional per-channel predicate applied to
+    #   every recorded entity
+    # @return [Bunny::TopologyRecoveryReport] what was recovered and what was
+    #   skipped, with reasons
     # @private
     def recover_topology_with(filter = nil)
-      exchanges = @topology_registry.filtered_exchanges.reject(&:predeclared?)
-      queues = @topology_registry.filtered_queues
-      queue_bindings = @topology_registry.filtered_queue_bindings
-      exchange_bindings = @topology_registry.filtered_exchange_bindings
-      consumers = @topology_registry.filtered_consumers
+      report = TopologyRecoveryReport.new
 
-      if filter
-        exchanges = exchanges.select(&filter)
-        queues = queues.select(&filter)
-        queue_bindings = queue_bindings.select(&filter)
-        exchange_bindings = exchange_bindings.select(&filter)
-        consumers = consumers.select(&filter)
+      # First apply the optional per-channel predicate used by
+      # #recover_channel_topology, so the rest of the pass only reasons about
+      # the entities in scope for this recovery.
+      scoped_exchanges         = select_for_channel(@topology_registry.exchanges.values, filter)
+      scoped_queues            = select_for_channel(@topology_registry.queues.values, filter)
+      scoped_queue_bindings    = select_for_channel(@topology_registry.queue_bindings, filter)
+      scoped_exchange_bindings = select_for_channel(@topology_registry.exchange_bindings, filter)
+      scoped_consumers         = select_for_channel(@topology_registry.consumers.values, filter)
+
+      filtered_exchanges = @topology_registry.filtered_exchanges
+      filtered_queues    = @topology_registry.filtered_queues
+      filtered_queue_bindings    = @topology_registry.filtered_queue_bindings
+      filtered_exchange_bindings = @topology_registry.filtered_exchange_bindings
+      filtered_consumers = @topology_registry.filtered_consumers
+
+      # Record every in-scope entity that the user-provided filter deliberately
+      # excluded, so the skip is explainable instead of invisible. Entities
+      # that are marked as externally predeclared are re-classified below.
+      record_filtered_out(report, TopologyRecoveryReport::EXCHANGE,
+                          scoped_exchanges, select_for_channel(filtered_exchanges, filter))
+      record_filtered_out(report, TopologyRecoveryReport::QUEUE,
+                          scoped_queues, select_for_channel(filtered_queues, filter))
+      record_filtered_out(report, TopologyRecoveryReport::QUEUE_BINDING,
+                          scoped_queue_bindings, select_for_channel(filtered_queue_bindings, filter))
+      record_filtered_out(report, TopologyRecoveryReport::EXCHANGE_BINDING,
+                          scoped_exchange_bindings, select_for_channel(filtered_exchange_bindings, filter))
+      record_filtered_out(report, TopologyRecoveryReport::CONSUMER,
+                          scoped_consumers, select_for_channel(filtered_consumers, filter))
+
+      # The optional per-channel predicate used by #recover_channel_topology.
+      filtered_exchanges         = select_for_channel(filtered_exchanges, filter)
+      filtered_queues            = select_for_channel(filtered_queues, filter)
+      filtered_queue_bindings    = select_for_channel(filtered_queue_bindings, filter)
+      filtered_exchange_bindings = select_for_channel(filtered_exchange_bindings, filter)
+      filtered_consumers         = select_for_channel(filtered_consumers, filter)
+
+      # Externally predeclared entities are owned by another component and
+      # guaranteed to still exist. They therefore take precedence over the
+      # filter: this connection does not declare them, but they still satisfy
+      # the dependencies of bindings (and consumers). Only in-scope entities
+      # are considered.
+      external_exchanges = scoped_exchanges.select do |x|
+        @topology_registry.externally_predeclared_exchange?(x.name)
+      end
+      external_queues = scoped_queues.select do |q|
+        @topology_registry.externally_predeclared_queue?(q.name)
       end
 
-      @logger.debug { "Will recover #{exchanges.size} exchange(s)" }
-      exchanges.each do |x|
+      # Exchanges that will exist on the broker once this pass completes.
+      available_exchanges = Set.new
+      external_exchange_names = Set.new(external_exchanges.map(&:name))
+
+      # Exchanges this connection must actually declare.
+      exchanges_to_declare = []
+      filtered_exchanges.each do |x|
+        if external_exchange_names.include?(x.name)
+          # re-classify a filtered-out external entity rather than declare it
+          report.replace_skip(TopologyRecoveryReport::EXCHANGE, x,
+                              TopologyRecoveryReport::EXTERNALLY_PREDECLARED)
+          available_exchanges.add(x.name)
+        elsif x.predefined?
+          report.record_skipped(TopologyRecoveryReport::EXCHANGE, x,
+                                TopologyRecoveryReport::PREDECLARED)
+          available_exchanges.add(x.name)
+        else
+          exchanges_to_declare << x
+        end
+      end
+      # External exchanges that the filter removed entirely still count as
+      # available dependencies and get an explicit, explainable skip.
+      external_exchanges.each do |x|
+        next if filtered_exchanges.include?(x)
+
+        report.replace_skip(TopologyRecoveryReport::EXCHANGE, x,
+                            TopologyRecoveryReport::EXTERNALLY_PREDECLARED)
+        available_exchanges.add(x.name)
+      end
+
+      # Queues that will exist on the broker once this pass completes.
+      available_queues = Set.new
+      external_queue_names = Set.new(external_queues.map(&:name))
+      queues_to_declare = []
+      filtered_queues.each do |q|
+        if external_queue_names.include?(q.name)
+          report.replace_skip(TopologyRecoveryReport::QUEUE, q,
+                              TopologyRecoveryReport::EXTERNALLY_PREDECLARED)
+          available_queues.add(q.name)
+        else
+          queues_to_declare << q
+        end
+      end
+      external_queues.each do |q|
+        next if filtered_queues.include?(q)
+
+        report.replace_skip(TopologyRecoveryReport::QUEUE, q,
+                            TopologyRecoveryReport::EXTERNALLY_PREDECLARED)
+        available_queues.add(q.name)
+      end
+
+      @logger.debug { "Will recover #{exchanges_to_declare.size} exchange(s)" }
+      exchanges_to_declare.each do |x|
         begin
           recover_exchange(x)
+          available_exchanges.add(x.name)
+          report.record_recovered(TopologyRecoveryReport::EXCHANGE, x)
         rescue ::StandardError => e
           @logger.error "Caught an exception while recovering exchange #{x.name}: #{e.inspect}"
         end
       end
 
-      @logger.debug { "Will recover #{queues.size} queue(s)" }
-      queues.each do |q|
+      @logger.debug { "Will recover #{queues_to_declare.size} queue(s)" }
+      queues_to_declare.each do |q|
         begin
           recover_queue(q)
+          available_queues.add(q.name)
+          report.record_recovered(TopologyRecoveryReport::QUEUE, q)
         rescue ::StandardError => e
           @logger.error "Caught an exception while recovering queue #{q.name}: #{e.inspect}"
         end
       end
 
-      @logger.debug { "Will recover #{queue_bindings.size + exchange_bindings.size} binding(s)" }
-      queue_bindings.each do |b|
+      @logger.debug do
+        "Will recover #{filtered_queue_bindings.size + filtered_exchange_bindings.size} binding(s)"
+      end
+
+      filtered_queue_bindings.each do |b|
+        unless available_exchanges.include?(b.source)
+          report.record_skipped(TopologyRecoveryReport::QUEUE_BINDING, b,
+                                TopologyRecoveryReport::MISSING_SOURCE_EXCHANGE)
+          next
+        end
+        unless available_queues.include?(b.destination)
+          report.record_skipped(TopologyRecoveryReport::QUEUE_BINDING, b,
+                                TopologyRecoveryReport::MISSING_DESTINATION_QUEUE)
+          next
+        end
+
         begin
           recover_queue_binding(b)
+          report.record_recovered(TopologyRecoveryReport::QUEUE_BINDING, b)
         rescue ::StandardError => e
           @logger.error "Caught an exception while recovering a binding of queue #{b.destination}: #{e.inspect}"
         end
       end
 
-      exchange_bindings.each do |b|
+      filtered_exchange_bindings.each do |b|
+        unless available_exchanges.include?(b.source)
+          report.record_skipped(TopologyRecoveryReport::EXCHANGE_BINDING, b,
+                                TopologyRecoveryReport::MISSING_SOURCE_EXCHANGE)
+          next
+        end
+        unless available_exchanges.include?(b.destination)
+          report.record_skipped(TopologyRecoveryReport::EXCHANGE_BINDING, b,
+                                TopologyRecoveryReport::MISSING_DESTINATION_EXCHANGE)
+          next
+        end
+
         begin
           recover_exchange_binding(b)
+          report.record_recovered(TopologyRecoveryReport::EXCHANGE_BINDING, b)
         rescue ::StandardError => e
           @logger.error "Caught an exception while recovering a binding of exchange #{b.source}: #{e.inspect}"
         end
       end
 
-      @logger.debug { "Will recover #{consumers.size} consumer(s)" }
-      consumers.each do |c|
+      @logger.debug { "Will recover #{filtered_consumers.size} consumer(s)" }
+      # Consumers are always attempted: a consumer whose queue truly cannot be
+      # recovered fails on its own and is contained by the rescue below, so it
+      # never prevents the remaining consumers from being recovered.
+      filtered_consumers.each do |c|
         begin
           recover_consumer(c)
+          report.record_recovered(TopologyRecoveryReport::CONSUMER, c)
         rescue ::StandardError => e
           @logger.error "Caught an exception while recovering consumer #{c.consumer_tag} on queue #{c.queue_name}: #{e.inspect}"
         end
       end
+
+      report
+    end
+
+    # Records entities excluded by the user-provided topology recovery filter.
+    # @private
+    def record_filtered_out(report, kind, all_entities, kept_entities)
+      kept = Set.new(kept_entities)
+      all_entities.each do |entity|
+        unless kept.include?(entity)
+          report.record_skipped(kind, entity, TopologyRecoveryReport::FILTERED_OUT)
+        end
+      end
+    end
+
+    # Applies the optional per-channel predicate used by
+    # {#recover_channel_topology}.
+    # @private
+    def select_for_channel(entities, filter)
+      return entities if filter.nil?
+
+      entities.select(&filter)
     end
 
     # @param [Bunny::RecordedExchange] x

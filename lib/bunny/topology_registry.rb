@@ -44,11 +44,60 @@ module Bunny
       @exchange_bindings = Set.new
       @consumers = {}
 
+      # Entities that are known to still exist on the broker (for example
+      # because another application declares them) and therefore must not be
+      # declared again by topology recovery, even when they are filtered out
+      # of the entities that this connection re-declares. They still count as
+      # satisfied dependencies for bindings.
+      @external_exchanges = Set.new
+      @external_queues = Set.new
+
       @queue_mutex = Monitor.new
       @exchange_mutex = Monitor.new
       @binding_mutex = Monitor.new
       @consumer_mutex = Monitor.new
     end
+
+    #
+    # Externally predeclared entities
+    #
+    # @!group Externally predeclared entities
+
+    # Marks an exchange as a resource that is declared outside of this
+    # connection and is guaranteed to still exist after a reconnection.
+    #
+    # Such an exchange is not re-declared during topology recovery but is
+    # still treated as a dependency that can satisfy bindings.
+    #
+    # @param name [String]
+    def mark_exchange_as_externally_predeclared(name)
+      @exchange_mutex.synchronize { @external_exchanges.add(name) }
+    end
+
+    # @param name [String]
+    # @return [Boolean]
+    def externally_predeclared_exchange?(name)
+      @exchange_mutex.synchronize { @external_exchanges.include?(name) }
+    end
+
+    # Marks a queue as a resource that is declared outside of this
+    # connection and is guaranteed to still exist after a reconnection.
+    #
+    # Such a queue is not re-declared during topology recovery but is still
+    # treated as a dependency that can satisfy bindings and consumers.
+    #
+    # @param name [String]
+    def mark_queue_as_externally_predeclared(name)
+      @queue_mutex.synchronize { @external_queues.add(name) }
+    end
+
+    # @param name [String]
+    # @return [Boolean]
+    def externally_predeclared_queue?(name)
+      @queue_mutex.synchronize { @external_queues.include?(name) }
+    end
+
+    # @!endgroup
 
     #
     # Queues
