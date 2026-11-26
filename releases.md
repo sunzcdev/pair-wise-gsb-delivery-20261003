@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+  - `Async::LimitedQueue#enqueue` now commits batches larger than the queue's limit in segments instead of being able to overfill it. Each item is pushed individually and waits for space, so the limit is always respected. An optional block is invoked after every accepted item, providing an observable commit receipt (the running count and the item). If the sending task is cancelled while blocked, already-committed items remain on the queue and the remaining, never-accepted items are abandoned; other concurrent senders retain their FIFO ordering.
+
 ## v2.46.0
 
   - Fixed `Thread#kill` raising a `TypeError` while shutting down a thread with an active `Async::Reactor`.

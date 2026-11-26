@@ -151,5 +151,36 @@ module Async
 		def limited?
 			!@delegate.closed? && @delegate.size >= @delegate.max
 		end
+		
+		# Add multiple items to the queue, waiting for space one item at a time.
+		#
+		# A batch larger than the queue's {#limit} cannot be accepted all at once. Instead, the items are committed in segments: each item is pushed individually, blocking only while the queue is full, and resuming as consumers make room. The queue therefore never exceeds its {#limit}.
+		#
+		# Every accepted item is observable as soon as it is committed via the optional block. If the calling task is cancelled while waiting for space, the cancellation propagates immediately: items already committed remain on the queue (they are never lost), while the remaining, never-accepted items are abandoned. Other senders blocked on the same queue keep their FIFO ordering.
+		#
+		# @parameter items [Array(Object)] The items to enqueue.
+		# @yields {|committed, item| ...} Invoked once for every item, immediately after it has been committed to the queue.
+		# @yields committed [Integer] The number of items committed so far (1-based).
+		# @yields item [Object] The item that was just committed.
+		# @returns [Integer] The number of items that were committed to the queue.
+		# @raises [ClosedError] If the queue is closed before all items could be enqueued; items committed before the closure remain on the queue.
+		def enqueue(*items, &on_commit)
+			return 0 if items.empty?
+			
+			committed = 0
+			
+			items.each do |item|
+				begin
+					@delegate.push(item)
+				rescue ClosedQueueError
+					raise ClosedError, "Cannot enqueue items to a closed queue!"
+				end
+			
+				committed += 1
+				on_commit&.call(committed, item)
+			end
+			
+			return committed
+		end
 	end
 end
