@@ -157,3 +157,66 @@ def test_get() -> None:
     assert full is not registry._REGISTRY
     assert full["unit_tests"] is unit_tests
     assert full["system_tests"] is system_tests
+
+
+def test_isolated_starts_with_empty_registry() -> None:
+    @registry.session_decorator
+    def outer(session: nox.Session) -> None:
+        pass
+
+    with registry.isolated():
+        assert registry.get() == {}
+
+        @registry.session_decorator
+        def inner(session: nox.Session) -> None:
+            pass
+
+        assert list(registry.get()) == ["inner"]
+
+    # The registry observed before the block is restored on exit.
+    assert list(registry.get()) == ["outer"]
+
+
+def test_isolated_restores_state_on_exception() -> None:
+    @registry.session_decorator
+    def outer(session: nox.Session) -> None:
+        pass
+
+    def explode() -> None:
+        with registry.isolated():
+
+            @registry.session_decorator
+            def inner(session: nox.Session) -> None:
+                pass
+
+            assert list(registry.get()) == ["inner"]
+            msg = "boom"
+            raise RuntimeError(msg)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        explode()
+
+    # A failure halfway through the isolated block must still restore the
+    # previous registry, so a later Nox run cannot inherit partial state.
+    assert list(registry.get()) == ["outer"]
+
+
+def test_isolated_nested_blocks_are_independent() -> None:
+    with registry.isolated():
+
+        @registry.session_decorator
+        def outer(session: nox.Session) -> None:
+            pass
+
+        with registry.isolated():
+            assert registry.get() == {}
+
+            @registry.session_decorator
+            def inner(session: nox.Session) -> None:
+                pass
+
+            assert list(registry.get()) == ["inner"]
+
+        assert list(registry.get()) == ["outer"]
+
+    assert registry.get() == {}

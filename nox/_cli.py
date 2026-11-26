@@ -72,23 +72,31 @@ def __dir__() -> list[str]:
 def execute_workflow(args: NoxConfig) -> int:
     """
     Execute the appropriate tasks.
+
+    The whole workflow runs inside :func:`nox.registry.isolated`, so sessions
+    registered while the Noxfile is imported cannot leak into another Nox run
+    in the same process. This matters for callers driving Nox through its
+    Python API (for example, a daemon running several projects' Noxfiles in
+    turn); a plain single-project CLI run is unaffected, since it starts and
+    ends with an empty registry.
     """
 
-    return workflow.execute(
-        global_config=args,
-        workflow=(
-            tasks.load_nox_module,
-            tasks.merge_noxfile_options,
-            tasks.discover_manifest,
-            tasks.honor_usage_request,
-            tasks.filter_manifest,
-            tasks.honor_list_request,
-            tasks.run_manifest,
-            tasks.print_summary,
-            tasks.create_report,
-            tasks.final_reduce,
-        ),
-    )
+    with nox.registry.isolated():
+        return workflow.execute(
+            global_config=args,
+            workflow=(
+                tasks.load_nox_module,
+                tasks.merge_noxfile_options,
+                tasks.discover_manifest,
+                tasks.honor_usage_request,
+                tasks.filter_manifest,
+                tasks.honor_list_request,
+                tasks.run_manifest,
+                tasks.print_summary,
+                tasks.create_report,
+                tasks.final_reduce,
+            ),
+        )
 
 
 def get_dependencies(
@@ -467,7 +475,9 @@ def _main(*, main_ep: bool) -> None:
                     requires_python=requires_python,
                 )
 
-    nox.registry.reset()
+    # execute_workflow() isolates the session registry itself (see
+    # nox.registry.isolated), so an API-driven run in the same process can no
+    # longer inherit sessions left by a previous run.
     exit_code = execute_workflow(args)
 
     # Done; exit.

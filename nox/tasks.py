@@ -27,6 +27,7 @@ __lazy_modules__ = {
 }
 
 import ast
+import contextlib
 import importlib.util
 import json
 import os
@@ -46,6 +47,7 @@ from nox.sessions import Result, Status, _duration_str, resolve_allow_parallel
 
 if TYPE_CHECKING:
     import types
+    from collections.abc import Generator
 
     from nox._options import NoxConfig
 
@@ -65,6 +67,83 @@ __all__ = [
 
 def __dir__() -> list[str]:
     return __all__
+
+
+def _module_origin(module: types.ModuleType) -> str | None:
+    """Return the source path a module was (or is being) loaded from.
+
+    A half-initialised module left behind by a failed Noxfile import may not
+    yet have ``__path__``; ``__file__`` works for regular modules and for the
+    package's ``__init__``. Namespace packages only carry ``__path__``.
+    """
+    origin = getattr(module, "__file__", None)
+    if isinstance(origin, str):
+        return origin
+    paths = getattr(module, "__path__", None)
+    if isinstance(paths, Sequence) and paths:
+        first = next(iter(paths))
+        if isinstance(first, str):
+            return first
+    return None
+
+
+@contextlib.contextmanager
+def _isolated_noxfile_import(noxfile_parent_dir: str) -> Generator[None, None, None]:
+    """Keep one Noxfile's module discovery from leaking into later runs.
+
+    When Nox's Python API is driven several times in one process (e.g. a
+    daemon running the Noxfiles of several tool directories), every run would
+    otherwise share import state:
+
+    * the Noxfile directory is prepended to ``sys.path`` and stays there, so a
+      later project can import the previous project's local modules;
+    * the Noxfile itself is always registered as ``user_nox_module``, and any
+      local modules it imports (commonly a per-project ``helper.py``) are
+      cached in ``sys.modules`` under plain names, so a later project reuses
+      the cached copy instead of its own -- even if an earlier run failed
+      halfway through its Noxfile.
+
+    On entry the path/module state is snapshotted. On exit (including via an
+    exception) the path is restored, pre-existing module entries are put back,
+    and modules newly discovered underneath the Noxfile directory are evicted
+    from ``sys.modules``, so the next run rediscovers everything from its own
+    directory. Installed third-party packages and Nox itself are never touched.
+    """
+    original_path = list(sys.path)
+    if noxfile_parent_dir not in sys.path:
+        sys.path.insert(0, noxfile_parent_dir)
+
+    parent_real = os.path.realpath(noxfile_parent_dir)
+
+    def _is_local_module(name: str, module: types.ModuleType | None) -> bool:
+        if name == "user_nox_module":
+            return True
+        origin = _module_origin(module) if module is not None else None
+        return origin is not None and os.path.realpath(origin).startswith(
+            parent_real + os.sep
+        )
+
+    # Entries that already existed and point at local code: restore them on
+    # exit. Anything local that appears later was imported by this Noxfile and
+    # must be dropped instead, so a subsequent run in another directory cannot
+    # resolve the stale cached copy.
+    previous_entries = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_local_module(name, module)
+    }
+
+    try:
+        yield
+    finally:
+        sys.path[:] = original_path
+        for name in list(sys.modules):
+            if not _is_local_module(name, sys.modules.get(name)):
+                continue
+            if name in previous_entries:
+                sys.modules[name] = previous_entries[name]
+            else:
+                sys.modules.pop(name, None)
 
 
 def _load_and_exec_nox_module(global_config: NoxConfig) -> types.ModuleType:
@@ -90,12 +169,18 @@ def _load_and_exec_nox_module(global_config: NoxConfig) -> types.ModuleType:
     module = importlib.util.module_from_spec(spec)
     assert module is not None  # If None, fatal importlib error, would crash anyway
 
-    sys.modules["user_nox_module"] = module
-
     loader = spec.loader
     assert loader is not None  # If None, fatal importlib error, would crash anyway
+
+    noxfile_parent_dir = os.path.dirname(global_config.noxfile)
     # See https://docs.python.org/3/library/importlib.html#importing-a-source-file-directly
-    loader.exec_module(module)
+    # The import context isolates both the module cache and sys.path so that
+    # driving another Noxfile later in the same process rediscovers its own
+    # modules. The Noxfile module is registered under its fixed name only for
+    # the duration of execution, after which the previous state is restored.
+    with _isolated_noxfile_import(noxfile_parent_dir):
+        sys.modules["user_nox_module"] = module
+        loader.exec_module(module)
     return module
 
 
@@ -125,6 +210,14 @@ def load_nox_module(global_config: NoxConfig) -> types.ModuleType | int:
     global_config.noxfile = os.path.join(
         noxfile_parent_dir, os.path.basename(global_config_noxfile)
     )
+
+    # Each Noxfile load starts from a clean session registry. Without this,
+    # driving another Noxfile later in the same process would discover the
+    # previous project's sessions alongside (or instead of) its own. The
+    # process-level save/restore lives in nox._cli.execute_workflow via
+    # nox.registry.isolated(), so callers that already populated the registry
+    # outside of a workflow still get it back when the workflow finishes.
+    registry.reset()
 
     try:
         # Check ``nox.needs_version`` by parsing the AST.

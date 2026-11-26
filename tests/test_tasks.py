@@ -20,6 +20,7 @@ import copy
 import json
 import os
 import platform
+import sys
 import typing
 from pathlib import Path
 from textwrap import dedent
@@ -28,9 +29,11 @@ from unittest import mock
 import pytest
 
 import nox
+import nox._cli
 import nox._decorators
 import nox.logger
 from nox import _options, sessions, tasks
+from nox._cli import execute_workflow
 from nox.manifest import WARN_PYTHONS_IGNORED, Manifest
 
 if typing.TYPE_CHECKING:
@@ -989,3 +992,209 @@ def test_final_reduce() -> None:
     assert tasks.final_reduce([true, true], config) == 0
     assert tasks.final_reduce([true, false], config) == 1
     assert tasks.final_reduce([], config) == 0
+
+
+def _write_project(base: Path, name: str, *, failing: bool = False) -> Path:
+    project = base / name
+    project.mkdir()
+    (project / "helper.py").write_text(f'PROJECT = "{name}"\n', encoding="utf-8")
+    failure = 'raise RuntimeError("simulated mid-import failure")\n' if failing else ""
+    (project / "noxfile.py").write_text(
+        dedent(
+            f"""
+            import nox
+            import helper
+
+            {failure}
+            @nox.session
+            def the_session(session):
+                assert helper.PROJECT == "{name}"
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    return project
+
+
+def test_load_nox_module_isolates_sys_modules(tmp_path: Path) -> None:
+    project = _write_project(tmp_path, "proj_one")
+    config = _options.options.namespace(noxfile=str(project / "noxfile.py"))
+
+    cwd = os.getcwd()
+    module = tasks.load_nox_module(config)
+    try:
+        assert not isinstance(module, int)
+        # While the Noxfile ran, its plain-name helper resolved to the local
+        # copy; the module object keeps that binding alive after the import
+        # cache entry is removed.
+        assert module.helper.PROJECT == "proj_one"
+        assert Path(module.helper.__file__).parent == project
+    finally:
+        os.chdir(cwd)
+
+    # Leaving the load boundary evicts the Noxfile and its local imports, so
+    # the next run rediscovers modules from its own directory.
+    assert "helper" not in sys.modules
+    assert "user_nox_module" not in sys.modules
+
+
+def test_load_nox_module_cleans_up_after_failed_import(tmp_path: Path) -> None:
+    project = _write_project(tmp_path, "proj_broken", failing=True)
+    config = _options.options.namespace(noxfile=str(project / "noxfile.py"))
+
+    cwd = os.getcwd()
+    with pytest.raises(RuntimeError, match="mid-import failure"):
+        tasks.load_nox_module(config)
+    os.chdir(cwd)
+
+    # A half-failed import must not leave the local helper or the fixed-name
+    # Noxfile module cached for a later project run.
+    assert "helper" not in sys.modules
+    assert "user_nox_module" not in sys.modules
+
+
+def test_consecutive_loads_resolve_their_own_local_modules(
+    tmp_path: Path,
+) -> None:
+    first = _write_project(tmp_path, "first")
+    second = _write_project(tmp_path, "second")
+    cwd = os.getcwd()
+
+    try:
+        first_module = tasks.load_nox_module(
+            _options.options.namespace(noxfile=str(first / "noxfile.py"))
+        )
+        assert not isinstance(first_module, int)
+        assert "helper" not in sys.modules
+
+        second_module = tasks.load_nox_module(
+            _options.options.namespace(noxfile=str(second / "noxfile.py"))
+        )
+        assert not isinstance(second_module, int)
+        # The second project's plain-name ``helper`` resolves to its own file,
+        # not a cached copy left behind by the first project.
+        assert second_module.helper.PROJECT == "second"
+        assert Path(second_module.helper.__file__).parent == second
+        assert first_module.helper.PROJECT == "first"
+    finally:
+        os.chdir(cwd)
+
+    assert "helper" not in sys.modules
+    assert "user_nox_module" not in sys.modules
+
+
+def test_load_nox_module_restores_sys_path(tmp_path: Path) -> None:
+    project = _write_project(tmp_path, "proj_path")
+    config = _options.options.namespace(noxfile=str(project / "noxfile.py"))
+
+    original_path = list(sys.path)
+    cwd = os.getcwd()
+    try:
+        module = tasks.load_nox_module(config)
+        assert not isinstance(module, int)
+        # The Noxfile directory was added for the import but is removed again
+        # once loading finishes, so it cannot shadow another project later.
+        assert str(project) not in sys.path
+        assert sys.path == original_path
+    finally:
+        os.chdir(cwd)
+
+
+def test_load_nox_module_keeps_installed_packages(tmp_path: Path) -> None:
+    project = _write_project(tmp_path, "proj_installed")
+    config = _options.options.namespace(noxfile=str(project / "noxfile.py"))
+
+    cwd = os.getcwd()
+    try:
+        module = tasks.load_nox_module(config)
+        assert not isinstance(module, int)
+        assert sys.modules.get("pytest") is pytest
+    finally:
+        os.chdir(cwd)
+
+
+def test_execute_workflow_isolates_sessions_between_projects(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A daemon-style caller drives two tool directories through the Python API
+    # in one process. Each project's listing must contain only its own
+    # sessions, regardless of what earlier runs registered.
+    # pytest leaves positional test arguments in sys.argv; pin it so nothing
+    # in the option machinery can mistake them for session selectors.
+    monkeypatch.setattr(sys, "argv", ["nox"])
+
+    first = _write_project(tmp_path, "first")
+    second = _write_project(tmp_path, "second")
+
+    def list_sessions(project: Path) -> tuple[int, str]:
+        config = _options.options.namespace(
+            noxfile=str(project / "noxfile.py"),
+            envdir=str(project / ".nox"),
+            list_sessions=True,
+            sessions=None,
+            keywords=None,
+            tags=None,
+        )
+        cwd = os.getcwd()
+        try:
+            return_code = execute_workflow(config)
+        finally:
+            os.chdir(cwd)
+        stdout, _ = capsys.readouterr()
+        return return_code, stdout
+
+    rc_one, out_one = list_sessions(first)
+    assert rc_one == 0
+    assert "the_session" in out_one
+
+    rc_two, out_two = list_sessions(second)
+    assert rc_two == 0
+    assert "the_session" in out_two
+    # Sessions registered by the first run do not appear in the second report.
+    assert out_two.count("the_session") == 1
+
+    # Re-running the first project still reports exactly its own session and
+    # leaves the process-wide registry empty once the workflow returns.
+    rc_again, out_again = list_sessions(first)
+    assert rc_again == 0
+    assert out_again.count("the_session") == 1
+    assert nox.registry.get() == {}
+
+
+def test_execute_workflow_restores_registry_after_failed_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["nox"])
+
+    broken = _write_project(tmp_path, "broken", failing=True)
+    healthy = _write_project(tmp_path, "healthy")
+
+    cwd = os.getcwd()
+    with pytest.raises(RuntimeError, match="mid-import failure"):
+        execute_workflow(
+            _options.options.namespace(
+                noxfile=str(broken / "noxfile.py"),
+                envdir=str(broken / ".nox"),
+            )
+        )
+    os.chdir(cwd)
+
+    # The failed run's partial registrations and local module are cleaned up.
+    assert nox.registry.get() == {}
+    assert "helper" not in sys.modules
+
+    rc = execute_workflow(
+        _options.options.namespace(
+            noxfile=str(healthy / "noxfile.py"),
+            envdir=str(healthy / ".nox"),
+            list_sessions=True,
+            sessions=None,
+            keywords=None,
+            tags=None,
+        )
+    )
+    assert rc == 0
+    assert list(nox.registry.get()) == []

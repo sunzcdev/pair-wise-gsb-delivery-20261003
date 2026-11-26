@@ -14,8 +14,16 @@
 
 from __future__ import annotations
 
-__lazy_modules__ = {"copy", "functools", "warnings", f"{__spec__.parent}._decorators"}
+__lazy_modules__ = {
+    "collections.abc",
+    "contextlib",
+    "copy",
+    "functools",
+    "warnings",
+    f"{__spec__.parent}._decorators",
+}
 
+import contextlib
 import copy
 import functools
 import warnings
@@ -25,11 +33,11 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 from ._decorators import Func
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Generator, Sequence
 
     from ._typing import Python
 
-__all__ = ["get", "reset", "session_decorator"]
+__all__ = ["get", "isolated", "reset", "session_decorator"]
 
 
 def __dir__() -> list[str]:
@@ -43,6 +51,30 @@ _REGISTRY: dict[str, Func] = {}
 
 def reset() -> None:
     _REGISTRY.clear()
+
+
+@contextlib.contextmanager
+def isolated() -> Generator[None, None, None]:
+    """Run a block with a private session registry, restoring state afterwards.
+
+    Nox's Python API can be driven more than once in the same process (for
+    example, a daemon that runs the Noxfiles of several tool directories in
+    turn). Decorated sessions land in the process-wide ``_REGISTRY``, which
+    would otherwise leak between runs and between projects. This context
+    manager snapshots the registry on entry, starts the block with an empty
+    registry, and restores the snapshot on exit -- even if the block raises,
+    including a failure partway through loading a Noxfile.
+
+    A single CLI invocation behaves exactly as before: the snapshot is empty
+    and is restored empty.
+    """
+    snapshot = copy.copy(_REGISTRY)
+    _REGISTRY.clear()
+    try:
+        yield
+    finally:
+        _REGISTRY.clear()
+        _REGISTRY.update(snapshot)
 
 
 @overload
