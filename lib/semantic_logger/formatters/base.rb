@@ -2,8 +2,9 @@ require "time"
 module SemanticLogger
   module Formatters
     class Base
-      attr_accessor :log, :logger, :log_host, :log_application, :log_environment, :precision,
+      attr_accessor :logger, :log_host, :log_application, :log_environment, :precision,
                     :escape_control_chars, :log_exception_details
+      attr_reader :log
 
       # Printable escapes for the most common control characters. Any other ASCII
       # control character is escaped to its hexadecimal `\xHH` form by
@@ -93,6 +94,16 @@ module SemanticLogger
       #     SemanticLogger.backtrace_cleaner=).
       #     Default: true for the text formatters (Default and those built on it) and the Json
       #     formatters, false otherwise.
+      #   sensitive_keys: [Array|Regexp|Object|nil]
+      #     Keys whose values this formatter alone replaces with "[FILTERED]", in the payload,
+      #     named tags, context, and metric dimensions of the entries it writes. Takes the same
+      #     values as SemanticLogger.sensitive_keys=, which applies to every appender and keeps
+      #     applying as the base these keys add to. For an appender that sends entries out, name
+      #     here the diagnostic sub-keys it must mask that an appender that keeps them, such as
+      #     an in-memory one, is built without.
+      #     The entry itself is never changed: this formatter writes a redacted view of it (see
+      #     Log#redacted), so the appenders that run after it receive the entry as it was.
+      #     Default: nil
       def initialize(time_format: nil,
                      log_host: true,
                      log_application: true,
@@ -100,7 +111,8 @@ module SemanticLogger
                      precision: PRECISION,
                      escape_control_chars: false,
                      log_exception_details: default_log_exception_details,
-                     backtrace_cleaner: default_backtrace_cleaner)
+                     backtrace_cleaner: default_backtrace_cleaner,
+                     sensitive_keys: nil)
         self.time_format      = time_format || self.class.build_time_format(precision)
         @log_host             = log_host
         @log_application      = log_application
@@ -109,6 +121,8 @@ module SemanticLogger
         @escape_control_chars  = escape_control_chars
         @log_exception_details = log_exception_details
         self.backtrace_cleaner = backtrace_cleaner
+        # Compared by identity, since the keys, such as a test double, need not define #nil?.
+        @redactor = Redactor.new(sensitive_keys) unless nil.equal?(sensitive_keys)
       end
 
       # Returns [String|Symbol] the `time_format` option. See #initialize.
@@ -137,6 +151,19 @@ module SemanticLogger
         end
 
         @backtrace_cleaner = cleaner
+      end
+
+      # Returns the `sensitive_keys` option, as supplied, or nil when this formatter has none.
+      # See #initialize.
+      def sensitive_keys
+        @redactor&.sensitive_keys
+      end
+
+      # Sets the log entry being formatted. When this formatter has sensitive keys of its own,
+      # the entry is replaced with a redacted view of it (see Log#redacted), so that the entry
+      # itself, which the appenders after this one still write, is never changed.
+      def log=(log)
+        @log = @redactor ? log.redacted(@redactor) : log
       end
 
       # Return default time format string

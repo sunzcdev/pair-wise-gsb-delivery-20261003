@@ -504,18 +504,38 @@ module SemanticLogger
 
     # Replaces this entry's payload, named tags, context, and metric dimensions, the fields that
     # hold keyed data, with copies in which the value of every sensitive key is replaced (see
-    # Redactor#redact). Returns self.
-    #
-    # The values replaced are left as they are, since they can be the application's own, or be
-    # shared with other entries, as named tags are. A field with no sensitive key is kept as it is.
+    # Redactor#redact). Returns self. The values replaced are left as they are, since they can be
+    # the application's own, or be shared with other entries, as named tags are.
     #
     # Called once, before the entry is written to any appender (see SemanticLogger.sensitive_keys=).
     def redact(redactor)
-      self.payload    = redactor.redact(payload)
-      self.named_tags = redactor.redact(named_tags)
-      self.context    = redactor.redact(context)
-      self.dimensions = redactor.redact(dimensions)
+      view = redacted(redactor)
+      self.payload    = view.payload
+      self.named_tags = view.named_tags
+      self.context    = view.context
+      self.dimensions = view.dimensions
       self
+    end
+
+    # Returns [Log] a copy of this entry with the values of the sensitive keys replaced, as #redact
+    # replaces them, or this entry itself when it holds none. This entry is never changed, so the
+    # appenders that run after still receive it as it is: a formatter with sensitive keys of its
+    # own (see Formatters::Base#initialize) writes the copy. The copy shares every other field with
+    # this entry, including the exception and the cached values, such as cleaned backtraces.
+    def redacted(redactor)
+      new_payload    = redactor.redact(payload)
+      new_named_tags = redactor.redact(named_tags)
+      new_context    = redactor.redact(context)
+      new_dimensions = redactor.redact(dimensions)
+      return self if new_payload.equal?(payload) && new_named_tags.equal?(named_tags) &&
+                     new_context.equal?(context) && new_dimensions.equal?(dimensions)
+
+      view            = dup
+      view.payload    = new_payload
+      view.named_tags = new_named_tags
+      view.context    = new_context
+      view.dimensions = new_dimensions
+      view
     end
 
     # A metric only event has a metric but no message or exception.

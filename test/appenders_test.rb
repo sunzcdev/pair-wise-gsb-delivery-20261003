@@ -28,6 +28,15 @@ class AppendersTest < Minitest::Test
     end
   end
 
+  # Records what its formatter writes for each log message.
+  class FormattingAppender < SemanticLogger::Subscriber
+    attr_reader :formatted
+
+    def log(log)
+      @formatted = format_log(log)
+    end
+  end
+
   class RaisingReopenAppender < SemanticLogger::Test::CaptureLogEvents
     def reopen
       raise "reopen boom"
@@ -303,6 +312,36 @@ class AppendersTest < Minitest::Test
           appenders.log(log)
 
           assert_same payload, recording.events.first.payload
+        end
+
+        it "gives an appender whose formatter has keys of its own a redacted view, and the ones after it the entry" do
+          # The appender that sends the entry out masks the diagnostic sub-keys with its
+          # formatter's own sensitive keys; the in-memory appender after it keeps them.
+          masking = FormattingAppender.new(
+            formatter: SemanticLogger::Formatters::Json.new(sensitive_keys: [:memory_bytes])
+          )
+          recording = SemanticLogger::Test::CaptureLogEvents.new
+          appenders << masking
+          appenders << recording
+
+          log.payload = {password: "secret", diagnostics: {worker: "w1", memory_bytes: 1024}}
+          appenders.log(log)
+
+          # The global keys are the base for both appenders; the formatter's own keys
+          # apply to its output alone.
+          parsed = JSON.parse(masking.formatted)
+
+          assert_equal SemanticLogger::Redactor::MASK, parsed.dig("payload", "password")
+          assert_equal SemanticLogger::Redactor::MASK, parsed.dig("payload", "diagnostics", "memory_bytes")
+          assert_equal "w1", parsed.dig("payload", "diagnostics", "worker")
+
+          # The appender after it receives the entry as it is: the global keys redacted
+          # once, the diagnostic fields kept.
+          assert_equal(
+            {password: SemanticLogger::Redactor::MASK, diagnostics: {worker: "w1", memory_bytes: 1024}},
+            recording.events.first.payload
+          )
+          assert_equal 1024, log.payload[:diagnostics][:memory_bytes]
         end
       end
     end

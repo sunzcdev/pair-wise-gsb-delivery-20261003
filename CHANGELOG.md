@@ -7,6 +7,14 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- A formatter accepts `sensitive_keys` of its own, such as
+  `formatter: {json: {sensitive_keys: [:memory_bytes]}}`, and replaces their values with
+  `[FILTERED]` in the entries it writes, in addition to `SemanticLogger.sensitive_keys`, which
+  keeps applying to every appender. For an appender that sends entries out and must mask
+  diagnostic sub-keys that another appender, such as an in-memory one, may keep. The entry itself
+  is never changed: the formatter writes a redacted view of it, from the new `Log#redacted`, so
+  the appenders that run after it receive the entry as it was. See
+  [Redacting for one appender](https://logger.reidmorrison.com/security.html#redacting-for-one-appender).
 - The formatters that write a metric with its log entry also write the metric's `dimensions`:
   `:json`, `:raw`, `:fluentd`, `:ecs`, `:syslog_cee`, and `:new_relic_logs` as a `dimensions` Hash,
   `:loki` as a `dimensions` value in JSON, and `:open_telemetry` as a

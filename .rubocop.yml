@@ -64,6 +64,8 @@ Metrics/ClassLength:
     - "spec/**/*"
     # Large abstract base class shared by Logger and Subscriber.
     - "lib/semantic_logger/base.rb"
+    # The log entry, whose fields and their handling live on the one value object.
+    - "lib/semantic_logger/log.rb"
 
 # Soften limits
 Metrics/MethodLength:

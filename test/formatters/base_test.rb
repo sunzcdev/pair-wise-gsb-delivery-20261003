@@ -61,6 +61,30 @@ module SemanticLogger
           end
         end
 
+        describe "#sensitive_keys" do
+          it "is nil by default, and the entry is formatted as it is" do
+            assert_nil formatter.sensitive_keys
+            assert_same log, formatter.log
+          end
+
+          it "redacts a view of the entry with its own keys, leaving the entry as it is" do
+            custom      = SemanticLogger::Formatters::Base.new(sensitive_keys: [:password])
+            log.payload = {password: "x"}
+            custom.log  = log
+
+            assert_equal [:password], custom.sensitive_keys
+            refute_same log, custom.log
+            assert_equal({password: SemanticLogger::Redactor::MASK}, custom.log.payload)
+            assert_equal({password: "x"}, log.payload)
+          end
+
+          it "raises ArgumentError for keys it cannot match" do
+            error = assert_raises(ArgumentError) { SemanticLogger::Formatters::Base.new(sensitive_keys: 42) }
+
+            assert_includes error.message, "sensitive keys"
+          end
+        end
+
         describe "#pid" do
           it "returns the current process id" do
             assert_equal $$, formatter.pid

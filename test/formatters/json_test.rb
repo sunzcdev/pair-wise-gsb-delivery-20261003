@@ -262,6 +262,88 @@ module SemanticLogger
           end
         end
 
+        # An appender that sends entries out can mask diagnostic sub-keys that an in-memory
+        # appender keeps, with sensitive keys of its formatter's own, on top of the global
+        # SemanticLogger.sensitive_keys.
+        describe "with its own sensitive keys" do
+          let(:mask) { SemanticLogger::Redactor::MASK }
+
+          # Anonymous test values: a Struct of an anonymous class in the payload, and an
+          # exception of an anonymous class, whose details the formatter writes.
+          let(:diagnostics) { Struct.new(:worker, :memory_bytes, :api_key).new("w1", 1024, "abc123") }
+          let(:exception_class) { Class.new(StandardError) }
+
+          let(:log) do
+            log         = SemanticLogger::Log.new("JsonTest", level)
+            log.time    = log_time
+            log.message = "Collected"
+            log.payload = {diagnostics: diagnostics}
+            begin
+              raise exception_class, "disk full"
+            rescue exception_class => e
+              log.exception = e
+            end
+            log
+          end
+
+          let(:masking) { SemanticLogger::Formatters::Json.new(sensitive_keys: %i[api_key memory_bytes]) }
+          let(:keeping) { SemanticLogger::Formatters::Json.new }
+
+          it "writes the entry as its own keys say, whichever formatter runs first, without changing it" do
+            # The masking formatter runs first, as an appender added before another does, and second.
+            forward = [masking, keeping].map { |formatter| JSON.parse(formatter.call(log, appender)) }
+            reverse = [keeping, masking].map { |formatter| JSON.parse(formatter.call(log, appender)) }
+
+            # Each formatter writes the same fields in either order.
+            assert_equal forward, reverse.reverse
+            masked, kept = forward
+
+            assert_equal mask, masked.dig("payload", "diagnostics", "api_key")
+            assert_equal mask, masked.dig("payload", "diagnostics", "memory_bytes")
+            assert_equal "w1", masked.dig("payload", "diagnostics", "worker")
+
+            assert_equal "abc123", kept.dig("payload", "diagnostics", "api_key")
+            assert_equal 1024, kept.dig("payload", "diagnostics", "memory_bytes")
+
+            # The exception's details, which are not redacted, are the same in both.
+            [masked, kept].each do |parsed|
+              assert_equal exception_class.to_s, parsed.dig("exception", "name")
+              assert_equal "disk full", parsed.dig("exception", "message")
+            end
+
+            # The log entry is never changed.
+            assert_same diagnostics, log.payload[:diagnostics]
+            assert_equal "abc123", diagnostics.api_key
+            assert_equal 1024, diagnostics.memory_bytes
+          end
+
+          it "keeps the entry itself when nothing in it is sensitive to it" do
+            log.payload = {worker: "w1"}
+            masking.call(log, appender)
+
+            assert_same log, masking.log
+          end
+
+          describe "with the global sensitive keys as its base" do
+            before { SemanticLogger.sensitive_keys = [:password] }
+            after { SemanticLogger.sensitive_keys = nil }
+
+            it "masks the global keys and its own" do
+              log.payload = {password: "secret", diagnostics: diagnostics}
+              # Redacted once before any appender writes the entry, as Appenders#log does.
+              log.redact(SemanticLogger.redactor)
+
+              masked = JSON.parse(masking.call(log, appender))
+              kept   = JSON.parse(keeping.call(log, appender))
+
+              assert_equal mask, masked.dig("payload", "password")
+              assert_equal mask, masked.dig("payload", "diagnostics", "api_key")
+              assert_equal mask, kept.dig("payload", "password")
+              assert_equal "abc123", kept.dig("payload", "diagnostics", "api_key")
+            end
+          end
+        end
+
         describe "payload values that JSON cannot represent" do
           it "serializes a float that is not finite, instead of dropping the event" do
             log.message = "Transfer"

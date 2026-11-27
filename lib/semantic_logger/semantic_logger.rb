@@ -195,6 +195,10 @@ module SemanticLogger
   # The keys are read when they are assigned, so changing an Array of them afterwards has no effect:
   # assign them again instead.
   #
+  # An appender whose output must mask further keys, such as diagnostic sub-keys that another
+  # appender may keep, names them in its formatter's own `sensitive_keys` option, which adds to
+  # these (see Formatters::Base#initialize).
+  #
   # When an entry cannot be redacted, for example because the keys raise an error, the field is
   # replaced with `{redaction_failed: "ErrorClass"}`, and the error is reported to the internal
   # logger.

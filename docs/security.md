@@ -200,6 +200,30 @@ When an entry cannot be redacted, for example because a Proc raises an error, th
 with `{redaction_failed: "ErrorClass"}`, never written as it is. The error's class, and where it was
 raised, are reported to the internal logger, but not its message, which could hold the value.
 
+#### Redacting for one appender
+
+The sensitive keys above apply to every appender. When one destination must not receive values that
+another may keep — for example an in-memory appender for operations that keeps a few diagnostic
+fields, while the JSON sent on to a log service must mask some of their sub-keys — give that
+appender's formatter sensitive keys of its own:
+
+~~~ruby
+# Keeps the diagnostic fields.
+SemanticLogger.add_appender(io: $stdout, formatter: :color)
+
+# Masks the diagnostic sub-keys in what it sends, in addition to the global sensitive keys.
+SemanticLogger.add_appender(
+  appender:  :http,
+  url:       "https://logs.example.com/ingest",
+  formatter: {json: {sensitive_keys: %i[memory_bytes diag]}}
+)
+~~~
+
+The formatter's keys take the same values as `SemanticLogger.sensitive_keys=`, and add to it: the
+global keys keep applying to every appender. The entry itself is never changed — the formatter
+writes a redacted view of it (see `Log#redacted`), so the appenders that run after it receive the
+entry as it was. Every built-in formatter accepts `sensitive_keys`.
+
 #### With Rails
 
 [rails_semantic_logger](https://github.com/reidmorrison/rails_semantic_logger) sets

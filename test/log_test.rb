@@ -1450,6 +1450,53 @@ module SemanticLogger
         end
       end
 
+      describe "#redacted" do
+        let(:redactor) { SemanticLogger::Redactor.new(%i[password authorization]) }
+        let(:mask) { SemanticLogger::Redactor::MASK }
+
+        it "returns a redacted copy, leaving the entry as it is" do
+          payload     = {user: "jack", password: "x"}
+          named_tags  = {authorization: "Bearer abc", request_id: "r1"}.freeze
+          log.payload = payload
+          log.named_tags = named_tags
+          log.set_context(:request, {headers: {"Authorization" => "Bearer abc"}})
+          log.dimensions = {password: "x", region: "us"}
+
+          view = log.redacted(redactor)
+
+          refute_same log, view
+          assert_equal({user: "jack", password: mask}, view.payload)
+          assert_equal({authorization: mask, request_id: "r1"}, view.named_tags)
+          assert_equal({request: {headers: {"Authorization" => mask}}}, view.context)
+          assert_equal({password: mask, region: "us"}, view.dimensions)
+
+          # Neither the entry nor the values it was given are changed.
+          assert_same payload, log.payload
+          assert_same named_tags, log.named_tags
+          assert_equal({user: "jack", password: "x"}, payload)
+          assert_equal({authorization: "Bearer abc", request_id: "r1"}, named_tags)
+        end
+
+        it "returns the entry itself when it holds no sensitive key" do
+          log.payload = {user: "jack"}
+
+          assert_same log, log.redacted(redactor)
+        end
+
+        it "shares the message, tags, and exception with the copy" do
+          log.message   = "password: x"
+          log.tags      = ["password"]
+          log.exception = exception
+          log.payload   = {password: "x"}
+
+          view = log.redacted(redactor)
+
+          assert_equal "password: x", view.message
+          assert_same log.tags, view.tags
+          assert_same exception, view.exception
+        end
+      end
+
       describe "#metric_only?" do
         it "is true when only a metric is present" do
           log.metric = "user/login"
