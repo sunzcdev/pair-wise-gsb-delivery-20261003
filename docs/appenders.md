@@ -289,6 +289,34 @@ Notes:
   `exception.details`, enable `log_exception_details`: `formatter: {json: {log_exception_details: true}}`.
   See [Exception details](config.html#exception-details).
 
+#### Entries that cannot be encoded
+
+An entry is written only if everything in it can be encoded as JSON. A batch, such as one sent by an
+appender added with `batch: true`, holds entries from any number of loggers; if one entry cannot be
+encoded, the others are written as usual, in the order they were logged, and the one at fault is
+replaced in its place by a summary of what was safe to report:
+
+~~~json
+{"encoding_failed": {"type": "NoMethodError", "position": 1, "reason": "undefined method 'name' for nil"}}
+~~~
+
+* `type` is the class of the error that encoding raised, and `reason` its message, cut short at 200
+  characters.
+* `position` is where the entry was in the batch, counted from 0, so the summary can be matched to
+  the events around it.
+* None of the entry's own fields is written, since they are what could not be encoded, so a consumer
+  tells the summary from a log entry by these three keys, which a log entry does not have.
+
+So an appender sends one batch that holds every entry it can. It never has to write the batch again
+to find the entry at fault, which could send the entries before it twice. A healthy entry written in
+a batch is exactly what the formatter writes for it on its own, so single and batched output have the
+same fields.
+
+A single entry, written on its own by an appender without batching, still raises when it cannot be
+encoded: the appender discards that one entry, as it discards any entry whose content cannot be
+written (see [Writing a custom appender](config.html#writing-a-custom-appender)), and carries on with
+the next one. The `:ecs` and `:fluentd` formatters isolate a batch the same way.
+
 ### Fluentd
 
 `formatter: :fluentd` is the same as `:json`, except it renames the log level fields to `severity` and

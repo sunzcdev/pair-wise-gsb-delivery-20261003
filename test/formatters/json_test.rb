@@ -288,6 +288,124 @@ module SemanticLogger
             refute_includes formatter.call(log, appender), "secret"
           end
         end
+
+        # A batch holds the entries of any number of loggers. One entry that cannot be encoded
+        # must not lose the entries around it, nor make the batch impossible to write, since an
+        # appender that had to write the batch again to find it could send the entries before it
+        # twice.
+        describe "#batch" do
+          # An object whose own #to_json raises, as a local object with a broken serializer does.
+          let(:unencodable) do
+            object = Object.new
+            object.instance_variable_set(:@password, "s3cr3t")
+            def object.to_json(*) = raise(NoMethodError, "undefined method 'name' for nil")
+            object
+          end
+
+          # Three entries, logged by different loggers, with the object in the middle one's payload.
+          let(:logs) do
+            names = %w[Order OrderLine Shipment]
+            entries = names.map do |name|
+              entry      = SemanticLogger::Log.new(name, :info)
+              entry.time = log_time
+              entry
+            end
+            entries[0].message = "placed"
+            entries[1].message = "priced"
+            entries[1].payload = {client: unencodable}
+            entries[2].message = "shipped"
+            entries
+          end
+
+          let(:entries) { JSON.parse(formatter.batch(logs, appender)) }
+
+          it "writes the entries it can, in the order they were logged, with #call's fields" do
+            # The entry in the middle is the summary, in the place it was logged, so it has no name.
+            assert_equal ["Order", nil, "Shipment"], entries.map { |entry| entry["name"] }
+            assert_equal ["placed", nil, "shipped"], entries.map { |entry| entry["message"] }
+            assert_equal ["test_host", nil, "test_host"], entries.map { |entry| entry["host"] }
+
+            # Each healthy entry is exactly what #call writes for it on its own.
+            assert_equal JSON.parse(formatter.call(logs[0], appender)), entries[0]
+            assert_equal JSON.parse(formatter.call(logs[2], appender)), entries[2]
+          end
+
+          it "writes only the type, position, and reason of the entry it cannot encode" do
+            summary = entries[1]
+
+            assert_equal(
+              {"type" => "NoMethodError", "position" => 1, "reason" => "undefined method 'name' for nil"},
+              summary
+            )
+            refute_includes formatter.batch(logs, appender), "s3cr3t"
+            refute_includes formatter.batch(logs, appender), "priced"
+          end
+
+          it "writes a healthy entry as it is when it is the only entry in the batch" do
+            entries = JSON.parse(formatter.batch([logs[0]], appender))
+
+            assert_equal [JSON.parse(formatter.call(logs[0], appender))], entries
+          end
+
+          # A Float that is not finite is a number JSON has no way to write, rather than data to
+          # repair, as the json gem itself treats it. The batch replaces the entry instead of
+          # quietly writing the number as a String.
+          it "replaces an entry whose value JSON cannot represent, keeping the entries around it" do
+            logs[1].payload = {amount: Float::NAN}
+
+            assert_equal ["Order", nil, "Shipment"], entries.map { |entry| entry["name"] }
+            assert_equal "JSON::GeneratorError", entries[1]["type"]
+            assert_equal 1,                     entries[1]["position"]
+
+            # Written on its own, the same entry is repaired, as it always has been.
+            assert_equal "NaN", JSON.parse(formatter.call(logs[1], appender))["payload"]["amount"]
+          end
+
+          it "does the same for an Infinity, which JSON also cannot represent" do
+            logs[1].payload = {amount: Float::INFINITY}
+
+            assert_equal "JSON::GeneratorError", entries[1]["type"]
+          end
+
+          it "keeps raising when a log is formatted on its own" do
+            assert_raises(NoMethodError) { formatter.call(logs[1], appender) }
+          end
+
+          it "writes every entry as a summary when none can be encoded, keeping their positions" do
+            logs.each { |entry| entry.payload = {client: unencodable} }
+
+            assert_equal [0, 1, 2], entries.map { |entry| entry["position"] }
+          end
+
+          it "cuts short the reason of a failure that quotes a large value" do
+            unencodable = Object.new
+            unencodable.define_singleton_method(:to_json) { |*| raise(ArgumentError, "bad value: #{"A" * 5_000}") }
+            logs[1].payload = {client: unencodable}
+
+            reason = entries[1]["reason"]
+
+            assert_operator reason.length, :<=, Formatters::Base::MAX_UNENCODABLE_REASON + 3
+            assert reason.end_with?("...")
+          end
+
+          it "writes a reason even when the error's own #message raises" do
+            unencodable = Object.new
+            unencodable.define_singleton_method(:to_json) do |*|
+              error = StandardError.new("the raised message")
+              error.define_singleton_method(:message) { raise NotImplementedError, "no message" }
+              raise error
+            end
+            logs[1].payload = {client: unencodable}
+
+            assert_equal "the raised message", entries[1]["reason"]
+          end
+
+          it "raises a SystemStackError rather than writing it as a summary" do
+            logs[1].stub(:cleansed_message, -> { raise SystemStackError }) do
+              assert_raises(SystemStackError) { formatter.batch(logs, appender) }
+            end
+          end
+        end
       end
     end
   end

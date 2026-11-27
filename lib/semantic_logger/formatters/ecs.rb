@@ -61,12 +61,16 @@ module SemanticLogger
       # Returns the log event as a single line of ECS-formatted JSON, so it can
       # be written to stdout / a file and shipped by Filebeat or Elastic Agent.
       def call(log, logger)
-        Utils.to_json(ecs_hash(super))
+        json_of(ecs_hash(super))
       end
 
       # Returns a batch of log events as a single JSON array.
+      #
+      # Each event is formatted by #call, so an event written in a batch has exactly the fields it
+      # has when it is written on its own. A log that cannot be encoded is written as a summary in
+      # its place, rather than failing the batch (see Base#encode_batch).
       def batch(logs, logger)
-        "[#{logs.map { |log| call(log, logger) }.join(',')}]"
+        encode_batch(logs, logger)
       end
 
       private

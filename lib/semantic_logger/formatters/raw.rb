@@ -123,6 +123,13 @@ module SemanticLogger
 
       # Returns log messages in Hash format
       def call(log, logger)
+        entry_hash(log, logger)
+      end
+
+      private
+
+      # Returns the log message as a Hash, the fields that #call writes.
+      def entry_hash(log, logger)
         self.hash   = {}
         self.log    = log
         self.logger = logger
@@ -146,8 +153,6 @@ module SemanticLogger
 
         hash
       end
-
-      private
 
       # Returns [Array<String>] the backtrace to write for the exception.
       #

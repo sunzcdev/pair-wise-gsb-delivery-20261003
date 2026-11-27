@@ -273,6 +273,83 @@ module SemanticLogger
         text if text.encoding == Encoding::UTF_8 || text.ascii_only?
       end
 
+      # Maximum number of characters of a failure's message that #unencodable_entry writes as its
+      # reason, so that an error quoting a large value cannot fill the log with it.
+      MAX_UNENCODABLE_REASON = 200
+
+      # Returns [String] the logs as one JSON array, in the order they were given.
+      #
+      # Each log is formatted by #call, so a log written in a batch has exactly the fields it has
+      # when it is written on its own, whatever logger it came from, and a subclass that writes its
+      # entry itself is formatted the same way. A log that #call cannot encode is replaced, in its
+      # place, by a summary of the failure (see #unencodable_entry), so that one bad log neither
+      # loses the logs around it nor makes the whole batch impossible to write. The appender
+      # therefore sends one batch that holds every log it can, rather than failing and writing the
+      # batch again to find the log at fault, which could write the logs before it twice.
+      #
+      # A value that JSON has no way to represent, such as a Float that is not finite, is what the
+      # batch replaces. #call repairs such a value, for example by writing a NaN as the String
+      # "NaN", so while a batch entry is formatted #json_of does not (see #encode_batch_entry). A
+      # log written on its own is still repaired, as before.
+      #
+      # For a formatter that writes JSON, such as Json and Ecs.
+      def encode_batch(logs, logger)
+        "[#{logs.each_with_index.map { |log, position| encode_batch_entry(log, logger, position) }.join(',')}]"
+      end
+
+      # Returns [String] the log's JSON, or the summary of why it cannot be encoded (see
+      # #unencodable_entry).
+      #
+      # The log is written by #call, exactly as it is written on its own, so a subclass that
+      # overrides #call formats an entry in a batch the same way. While it runs, #json_of writes a
+      # value that JSON cannot represent, such as a Float that is not finite, as it is, so that
+      # #call raises for it rather than repairing it (see #encode_batch).
+      #
+      # A StandardError or ScriptError is taken as caused by the content of the log, as
+      # Subscriber#format_log takes one from a formatter: a formatter has no destination, so it can
+      # only fail because of what it was given. A SystemStackError is raised as it is, as
+      # Subscriber#format_log raises it, since the thread that overflowed must not keep writing.
+      def encode_batch_entry(log, logger, position)
+        previous     = @batch_entry
+        @batch_entry = true
+        call(log, logger)
+      rescue StandardError, ScriptError => e
+        Utils.to_json(unencodable_entry(position, e))
+      ensure
+        @batch_entry = previous
+      end
+
+      # Returns [Hash] the entry that replaces, at `position`, a log that a batch could not encode.
+      #
+      # It holds only what is safe to write, since the log's own fields could not be encoded:
+      #   type:     [String] the class of the failure, named as Utils.exception_name names it,
+      #             without running the class's own code.
+      #   position: [Integer] the position of the log in the batch, counted from 0, so that the
+      #             summary stands in for the log in the order of the original entries.
+      #   reason:   [String] the failure's message, read as Utils.exception_message reads it, so
+      #             that a #message that raises cannot lose the summary, cut short at
+      #             MAX_UNENCODABLE_REASON characters.
+      #
+      # None of the fields of the log is written, and no other field is, so a log consumer tells
+      # such an entry from a log entry by these three keys, which a log entry does not have.
+      def unencodable_entry(position, exception)
+        {type: Utils.exception_name(exception), position: position, reason: unencodable_reason(exception)}
+      end
+
+      # Returns [String] the failure's message, cut short at MAX_UNENCODABLE_REASON characters.
+      def unencodable_reason(exception)
+        message = Utils.exception_message(exception)
+        message.length > MAX_UNENCODABLE_REASON ? "#{message[0, MAX_UNENCODABLE_REASON]}..." : message
+      end
+
+      # Returns [String] the JSON of the supplied Hash, as the JSON formatters write it. Within a
+      # batch entry (see #encode_batch_entry) a Float that is not finite raises, as the json gem
+      # writes it, rather than being written as a String, so that the log that holds it is replaced
+      # by a summary (see #encode_batch).
+      def json_of(hash)
+        Utils.to_json(hash, finite_floats: !@batch_entry)
+      end
+
       # Return the Time as a formatted string
       def format_time(time)
         time = time.dup

@@ -197,7 +197,15 @@ module SemanticLogger
     #
     # The retry is attempted only once: if it still fails (for example an object whose
     # own #to_json raises), the error propagates unchanged rather than being swallowed.
-    def self.to_json(value) = clean_json(value) || json_safe(value).to_json
+    #
+    # finite_floats: false treats a Float that is not finite, such as NaN and Infinity, as data JSON
+    # cannot represent after all, raising JSON::GeneratorError for it rather than writing it as a
+    # String, as the json gem itself does. A batch uses it to replace the entry holding such a value
+    # with a summary, keeping the entries around it (see Formatters::Base#encode_batch), since
+    # writing the value as a String would silently change a number into text.
+    def self.to_json(value, finite_floats: true)
+      clean_json(value) || json_safe(value, finite_floats: finite_floats).to_json
+    end
 
     # Returns the value when JSON writes it as it is, otherwise a .json_safe copy, for a writer
     # that serializes the value itself, such as GELF. The check costs one #to_json; only the
@@ -337,6 +345,11 @@ module SemanticLogger
     #   So is one that holds itself, at the point where it would repeat.
     # Any other value is returned as-is.
     #
+    # finite_floats: false leaves a Float that is not finite as it is, so that writing the copy
+    # raises JSON::GeneratorError, as the json gem writes it, rather than as one of the Strings
+    # above. A batch uses it to tell an entry holding such a value from one it can write in place
+    # (see .to_json and Formatters::Base#encode_batch).
+    #
     # The recursion never goes deeper than MAX_JSON_SAFE_DEPTH, and the placeholder does
     # not look inside the structure it replaces. Rendering it instead (for example with
     # #inspect) would recurse without limit through an arbitrarily deep structure,
@@ -344,19 +357,21 @@ module SemanticLogger
     # expose the instance variables of any object inside it. Ending a self-referencing
     # structure where it repeats, rather than at that depth, keeps one that holds itself
     # more than once from being copied an exponential number of times.
-    def self.json_safe(value, depth = 0, ancestors = nil)
+    def self.json_safe(value, depth = 0, ancestors = nil, finite_floats: true)
       case value
       when String
         encode_utf8_string(value)
       when Symbol then encode_utf8_symbol(value)
       when Float
-        value.finite? ? value : value.to_s
+        value.finite? || !finite_floats ? value : value.to_s
       when Integer, NilClass, TrueClass, FalseClass
         value
       else
         return json_safe_object(value) unless structure?(value)
 
-        bounded_structure(value, depth, ancestors) { |level, seen| json_safe_members(value, level, seen) }
+        bounded_structure(value, depth, ancestors) do |level, seen|
+          json_safe_members(value, level, seen, finite_floats: finite_floats)
+        end
       end
     end
 
@@ -391,20 +406,20 @@ module SemanticLogger
 
     # Returns a copy of the members of a Hash, Array, Set, Struct, Data, or OpenStruct (see
     # .structure_members), each made safe by .json_safe at the supplied depth.
-    def self.json_safe_members(value, depth, ancestors)
+    def self.json_safe_members(value, depth, ancestors, finite_floats: true)
       members = structure_members(value)
       if members.is_a?(Hash)
         members.each_with_object({}) do |(key, val), hash|
-          key       = json_safe(key, depth, ancestors)
+          key       = json_safe(key, depth, ancestors, finite_floats: finite_floats)
           key       = key.to_json if key.is_a?(Hash) || key.is_a?(Array)
-          hash[key] = json_safe(val, depth, ancestors)
+          hash[key] = json_safe(val, depth, ancestors, finite_floats: finite_floats)
         end
       elsif json_array?(value)
-        members.map { |element| json_safe(element, depth, ancestors) }
+        members.map { |element| json_safe(element, depth, ancestors, finite_floats: finite_floats) }
       else
         # A #to_h that does not return a Hash is made safe one level deeper, so that the
         # recursion still ends.
-        json_safe(members, depth, ancestors)
+        json_safe(members, depth, ancestors, finite_floats: finite_floats)
       end
     end
     private_class_method :json_safe_members

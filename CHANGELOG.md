@@ -103,6 +103,16 @@ This project adheres to [Semantic Versioning](http://semver.org/).
   it is discarded, and only those after it are written again, rather than the batch split up and
   written again in parts. See
   [Custom appenders](https://logger.reidmorrison.com/config.html#custom-appenders).
+- A batch written by the `:json` formatter, and by `:ecs` and `:fluentd`, no longer fails as a whole
+  when one of its entries cannot be encoded, for example because its payload holds an object whose
+  own `#to_json` raises. The other entries are written as they would be on their own, in the order
+  they were logged, and the entry at fault is replaced in its place by
+  `{"encoding_failed": {"type": "NoMethodError", "position": 1, "reason": "..."}}`: the class of the
+  error, the position of the entry in the batch, and the error's message, cut short. So a batch holds
+  every entry it can, whatever logger it came from, and an appender never writes the batch again to
+  find the entry at fault, which could send the entries before it twice. An entry written on its own
+  still raises, as before, and the appender discards it. See
+  [Entries that cannot be encoded](https://logger.reidmorrison.com/appenders.html#entries-that-cannot-be-encoded).
 
 ### Changed
 

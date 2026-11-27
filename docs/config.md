@@ -661,6 +661,16 @@ an `ArgumentError` for a block, or any other formatter that cannot format a batc
 them with `batch: true`. Add it without `batch: true` to send one request for each entry, formatted
 by the block.
 
+A `#batch` that formats every entry before sending them should also follow the rule the JSON
+formatters follow: when one entry cannot be encoded, write the others, in their original order, and
+put a summary of the failure in place of that entry, rather than failing the whole batch. An
+appender that fails the batch instead has to write it again to find the entry at fault, which can
+send the entries before it twice. A formatter that writes JSON can call
+`SemanticLogger::Formatters::Base#encode_batch(logs, logger)`, which does this for any `#call` that
+returns one entry's JSON: the entry at fault becomes
+`{"type": "...", "position": n, "reason": "..."}`. See
+[Entries that cannot be encoded](appenders.html#entries-that-cannot-be-encoded).
+
 When both a block and `formatter:` are given, the block takes precedence, and `formatter:` is
 ignored.
 
