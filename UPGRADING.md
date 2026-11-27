@@ -1,3 +1,17 @@
+# Upgrading to version 1.8
+Recurring execution history now survives the jobs it belongs to, so `solid_queue_recurring_executions` keeps growing one row per run until you compact it. `SolidQueue::RecurringExecution.clear_in_batches` now folds old, consecutive runs into a single row that still rejects duplicates, instead of deleting job-less rows, and `RecurringTask#missed_occurrences` / `#backfill_missed` let you inspect and enqueue the instants that never ran.
+
+This needs a new migration for existing installations:
+
+```bash
+bin/rails solid_queue:update
+bin/rails db:migrate
+```
+
+The migration adds the `folded_through` and `folded_interval` columns, makes `job_id` nullable, and changes the foreign key to `ON DELETE NULLIFY`, so deleting a job detaches its recurring execution rather than taking it with the cascade. Until you run it, Solid Queue keeps the previous behaviour: a recurring execution requires its job, and `clear_in_batches` deletes job-less rows.
+
+Before this change, the duplicate guarantee only held while you kept finished jobs around. After the migration, it holds whether or not you do, and the recurring-execution cleanup is what keeps that table small. Installing Solid Queue now also configures a `fold_solid_queue_recurring_executions` recurring task that runs the cleanup hourly; if you already installed it, add the equivalent entry to your `recurring.yml`. Retention is `config.solid_queue.clear_recurring_executions_after` (defaults to 1 day).
+
 # Upgrading to version 1.7.2
 Jobs with [concurrency controls](README.md#concurrency-controls) now remember which semaphore they got their slot from, in their serialized job data, and give the slot back only to that semaphore. Before, a job that ran past its `duration` gave its slot back to the semaphore a later job had created after the job's own one expired, so one more job than the limit allowed could run at the same time, and keep doing so until the jobs waiting for that key ran out.
 

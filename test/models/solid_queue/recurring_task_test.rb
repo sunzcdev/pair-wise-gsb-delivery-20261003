@@ -347,7 +347,67 @@ class SolidQueue::RecurringTaskTest < ActiveSupport::TestCase
     assert_equal at, options[:context][:at]
   end
 
+  test "missed_occurrences reports only the instants the recorded history doesn't cover" do
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every minute")
+    record_detached(task.key, run_at: Time.utc(2026, 1, 1, 0, 0))
+    record_detached(task.key, run_at: Time.utc(2026, 1, 1, 0, 2))
+
+    missed = task.missed_occurrences(from: Time.utc(2026, 1, 1, 0, 0), to: Time.utc(2026, 1, 1, 0, 3))
+
+    assert_equal [ Time.utc(2026, 1, 1, 0, 1), Time.utc(2026, 1, 1, 0, 3) ], missed
+  end
+
+  test "missed_occurrences doesn't count folded instants as missed" do
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every minute")
+    record_detached(
+      task.key, run_at: Time.utc(2026, 1, 1, 0, 0), folded_through: Time.utc(2026, 1, 1, 0, 2), folded_interval: 60
+    )
+
+    missed = task.missed_occurrences(from: Time.utc(2026, 1, 1, 0, 0), to: Time.utc(2026, 1, 1, 0, 3))
+
+    assert_equal [ Time.utc(2026, 1, 1, 0, 3) ], missed
+  end
+
+  test "backfill_missed enqueues the holes and skips the folded instants" do
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every minute").tap(&:save!)
+    record_detached(
+      task.key, run_at: Time.utc(2026, 1, 1, 0, 0), folded_through: Time.utc(2026, 1, 1, 0, 1), folded_interval: 60
+    )
+
+    enqueued = nil
+    assert_difference -> { SolidQueue::Job.count }, +1 do
+      enqueued = task.backfill_missed(from: Time.utc(2026, 1, 1, 0, 0), to: Time.utc(2026, 1, 1, 0, 2))
+    end
+
+    assert_equal [ Time.utc(2026, 1, 1, 0, 2) ], enqueued
+  end
+
+  test "two schedulers backfilling the same hole enqueue one job" do
+    task = recurring_task_with(class_name: "JobWithoutArguments", schedule: "every minute").tap(&:save!)
+    hole = Time.utc(2026, 1, 1, 0, 1)
+
+    results = Concurrent::Array.new
+    threads = 2.times.map do
+      Thread.new do
+        SolidQueue::Record.connection_pool.with_connection do
+          results << task.enqueue(at: hole)
+        end
+      end
+    end
+    threads.each(&:join)
+
+    assert_equal 1, results.count { |result| result }
+    assert_equal 1, SolidQueue::RecurringExecution.where(task_key: task.key).count
+    assert_equal 1, SolidQueue::Job.count
+  end
+
   private
+    def record_detached(task_key, run_at:, folded_through: nil, folded_interval: nil)
+      SolidQueue::RecurringExecution.insert!(
+        { task_key: task_key, run_at: run_at, folded_through: folded_through, folded_interval: folded_interval, job_id: nil }
+      )
+    end
+
     def with_time_zone(zone)
       previous = SolidQueue.time_zone
       SolidQueue.time_zone = zone

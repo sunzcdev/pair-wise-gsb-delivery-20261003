@@ -56,6 +56,16 @@ class UpdateGeneratorTest < Rails::Generators::TestCase
     end
   end
 
+  test "copies the recurring-execution folding migration" do
+    run_generator
+
+    assert_migration "db/queue_migrate/add_folded_recurring_executions_to_solid_queue.rb" do |migration|
+      assert_match(/class AddFoldedRecurringExecutionsToSolidQueue/, migration)
+      assert_match(/add_column :solid_queue_recurring_executions, :folded_through/, migration)
+      assert_match(/add_foreign_key :solid_queue_recurring_executions, :solid_queue_jobs, column: :job_id, on_delete: :nullify/, migration)
+    end
+  end
+
   private
     def with_migration_template(name)
       Dir.mktmpdir do |source_root|

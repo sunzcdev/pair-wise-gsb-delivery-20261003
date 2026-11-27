@@ -71,7 +71,9 @@ module SolidQueue
 
     def last_enqueued_time
       if recurring_executions.loaded?
-        recurring_executions.map(&:run_at).max
+        recurring_executions.map { |execution| execution.folded_through || execution.run_at }.max
+      elsif RecurringExecution.supports_folding?
+        recurring_executions.maximum(Arel.sql("COALESCE(folded_through, run_at)"))
       else
         recurring_executions.maximum(:run_at)
       end
@@ -92,12 +94,14 @@ module SolidQueue
           end
         end
 
-        active_job.tap do |enqueued_job|
-          payload[:active_job_id] = enqueued_job.job_id
+        if active_job
+          active_job.tap do |enqueued_job|
+            payload[:active_job_id] = enqueued_job.job_id
+          end
+        else
+          payload[:skipped] = true
+          false
         end
-      rescue RecurringExecution::AlreadyRecorded
-        payload[:skipped] = true
-        false
       rescue Job::EnqueueError => error
         report_enqueue_error(error, at: at)
         payload[:enqueue_error] = error.message
@@ -109,11 +113,71 @@ module SolidQueue
       "#{class_name}.perform_later(#{arguments.map(&:inspect).join(",")}) [ #{parsed_schedule.original} ]"
     end
 
+    # Old occurrences that the recorded history doesn't account for, oldest
+    # first, up to +limit+ and no further back than +from+. Folded history
+    # answers exactly which occurrences are covered, so a task that ran on a
+    # regular cadence reports only the instants it actually missed, not the
+    # ones the compaction squeezed out of its history.
+    #
+    # The scan is bounded by +scan_limit+ occurrences, so asking about a very
+    # wide window can't walk a second-by-second schedule forever. Pass a
+    # narrower +from+ to reach further back.
+    def missed_occurrences(from:, to: Time.current, limit: 200, scan_limit: 10_000)
+      return [] unless from && to && from < to
+
+      recorded = recorded_runs(from: from, to: to)
+      candidates = occurrences_between(from, to, limit: scan_limit)
+      candidates.reject { |time| recorded.any? { |execution| execution.covers?(time) } }.first(limit)
+    end
+
+    # Enqueues at most +limit+ missed occurrences, oldest first. Runs on more
+    # than one scheduler at once are safe: each one goes through the same
+    # (task_key, run_at) unique index as a regular run, so only one job per
+    # missed instant is enqueued and the folded occurrences stay silent.
+    def backfill_missed(from:, to: Time.current, limit: 100)
+      missed_occurrences(from: from, to: to, limit: limit).each_with_object([]) do |run_at, enqueued|
+        job = enqueue(at: run_at)
+        enqueued << run_at if job
+      end
+    end
+
     def attributes_for_upsert
       attributes.without("id", "created_at", "updated_at")
     end
 
     private
+      # The instants this task was due between +from+ and +to+, stepping by the
+      # schedule's own spacing. For plain cron schedules the spacing between
+      # consecutive runs is constant, except across DST shifts, so this walks
+      # forward with the schedule rather than assuming a fixed interval.
+      def occurrences_between(from, to, limit:)
+        times = []
+        time = first_occurrence_on_or_after(from)
+
+        while time && time <= to && times.size < limit
+          times << time
+          next_time = next_time_after(time)
+          break unless next_time && next_time > time
+          time = next_time
+        end
+
+        times
+      end
+
+      def first_occurrence_on_or_after(from)
+        parsed_schedule_with_time_zone.next_time(from - 1.second).utc
+      end
+
+      def recorded_runs(from:, to:)
+        scope = recurring_executions.where(run_at: ...to)
+
+        if RecurringExecution.supports_folding?
+          scope.where("COALESCE(folded_through, run_at) >= ?", from)
+        else
+          scope.where(run_at: from..)
+        end.to_a
+      end
+
       def ensure_schedule_supported
         unless parsed_schedule.instance_of?(Fugit::Cron)
           errors.add :schedule, :unsupported, message: "is not a supported recurring schedule"

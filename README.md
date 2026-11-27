@@ -454,6 +454,7 @@ There are several settings that control how Solid Queue works that you can set a
 - `supervisor_pidfile`: path to a pidfile that the supervisor will create when booting to prevent running more than one supervisor in the same host, or in case you want to use it for a health check. It's `nil` by default.
 - `preserve_finished_jobs`: whether to keep finished jobs in the `solid_queue_jobs` table—defaults to `true`.
 - `clear_finished_jobs_after`: period to keep finished jobs around, in case `preserve_finished_jobs` is true — defaults to 1 day. When installing Solid Queue, [a recurring job](#recurring-tasks) is automatically configured to clear finished jobs every hour on the 12th minute in batches. You can edit the `recurring.yml` configuration to change this as you see fit.
+- `clear_recurring_executions_after`: period to keep [recurring execution history](#keeping-recurring-history-small) at one row per run before `SolidQueue::RecurringExecution.clear_in_batches` folds it — defaults to 1 day. Nothing folds it until you call that method.
 - `default_concurrency_control_period`: the value to be used as the default for the `duration` parameter in [concurrency controls](#concurrency-controls). It defaults to 3 minutes.
 
 ### Validating the configuration
@@ -925,9 +926,41 @@ Rails.application.config.after_initialize do # or to_prepare
 end
 ```
 
-It's possible to run multiple schedulers with the same `recurring_tasks` configuration, for example, if you have multiple servers for redundancy, and you run the `scheduler` in more than one of them. To avoid enqueuing duplicate tasks at the same time, an entry in a new `solid_queue_recurring_executions` table is created in the same transaction as the job is enqueued. This table has a unique index on `task_key` and `run_at`, ensuring only one entry per task per time will be created. This only works if you have `preserve_finished_jobs` set to `true` (the default), and the guarantee applies as long as you keep the jobs around.
+It's possible to run multiple schedulers with the same `recurring_tasks` configuration, for example, if you have multiple servers for redundancy, and you run the `scheduler` in more than one of them. To avoid enqueuing duplicate tasks at the same time, an entry in a new `solid_queue_recurring_executions` table is created in the same transaction as the job is enqueued. This table has a unique index on `task_key` and `run_at`, ensuring only one entry per task per time will be created. This works whether or not you keep finished jobs around: the entry outlives its job (its `job_id` just becomes `NULL` when the job is deleted).
 
 **Note**: a single recurring schedule is supported, so you can have multiple schedulers using the same schedule, but not multiple schedulers using different configurations.
+
+#### Keeping recurring history small
+
+A task that runs often accumulates one `solid_queue_recurring_executions` row per run. `SolidQueue::RecurringExecution.clear_in_batches` compacts that history without losing the evidence that keeps duplicates out, and without ever claiming an instant the task didn't actually run:
+
+```ruby
+# Fold everything older than the default retention (1 day, see
+# config.solid_queue.clear_recurring_executions_after) into compact runs.
+SolidQueue::RecurringExecution.clear_in_batches
+
+# Or keep a week of one-row-per-run history and fold the rest.
+SolidQueue::RecurringExecution.clear_in_batches(retain: 7.days)
+```
+
+Old, consecutive occurrences with a constant spacing become a single *folded* row, whose `run_at`/`folded_through`/`folded_interval` describe the whole run, so they still count as recorded and won't be enqueued again. Occurrences the task missed — times where no row exists — stay gaps and can still be recorded later. Rows younger than the retention window are left as they are, so cleanup never seals a hole that could still be backfilled. Pass `retain: nil` to fold every age. For an existing installation, this needs the migration copied by `bin/rails solid_queue:update`; until you run it, cleanup deletes old job-less rows as it did before.
+
+#### Auditing and backfilling missed runs
+
+`missed_occurrences` lists the instants the task was due but has no record for, so administrators can check exactly which old runs didn't happen, even after their history was folded:
+
+```ruby
+task = SolidQueue::RecurringTask.find_by!(key: "a_periodic_job")
+task.missed_occurrences(from: 1.day.ago, to: Time.current, limit: 200)
+```
+
+`backfill_missed` enqueues them, oldest first, up to `limit`:
+
+```ruby
+task.backfill_missed(from: 1.day.ago, to: Time.current, limit: 100)
+```
+
+Both work from the task's schedule and its recorded history, so folded instants are counted as run and never reported or enqueued. Backfilling goes through the same `(task_key, run_at)` unique index as a regular run, so two schedulers backfilling the same hole at once still enqueue only one job.
 
 When a scheduler starts, it removes any static recurring tasks that are no longer in its configuration. If you remove all of them, though, no scheduler starts, so the old tasks stay in the `solid_queue_recurring_tasks` table, and in Mission Control, even though nothing runs them. You can delete them from a console with `SolidQueue::RecurringTask.static.delete_all`.
 

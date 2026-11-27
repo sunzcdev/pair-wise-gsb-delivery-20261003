@@ -43,6 +43,7 @@ module SolidQueue
 
   mattr_accessor :preserve_finished_jobs, default: true
   mattr_accessor :clear_finished_jobs_after, default: 1.day
+  mattr_accessor :clear_recurring_executions_after, default: 1.day
   mattr_accessor :default_concurrency_control_period, default: 3.minutes
 
   mattr_reader :time_zone

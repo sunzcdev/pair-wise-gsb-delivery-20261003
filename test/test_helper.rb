@@ -47,6 +47,7 @@ class ActiveSupport::TestCase
   include ConfigurationTestHelper, ProcessesTestHelper, JobsTestHelper
 
   def destroy_records
+    SolidQueue::RecurringExecution.delete_all
     SolidQueue::Job.destroy_all
     SolidQueue::Process.destroy_all
     SolidQueue::Semaphore.delete_all
