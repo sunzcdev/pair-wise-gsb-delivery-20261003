@@ -171,6 +171,38 @@ Only triggering expiry when we write means that if the cache is idle, the backgr
 
 If you want the cache expiry to be run in a background job instead of a thread, you can set `expiry_method` to `:job`. This will enqueue a `SolidCache::ExpiryJob`.
 
+## Adjusting several counters at once
+
+`increment` and `decrement` change one counter at a time. To change several counters in one call, use `adjust_multi`. Positive amounts increment and negative amounts decrement:
+
+```ruby
+result = Rails.cache.adjust_multi({ "views" => 1, "credits" => -5 }, token: "order-123")
+
+result.complete?      # => true when every counter was applied
+result.values         # => { "views" => 11, "credits" => 95 }
+result["credits"]     # => #<Outcome ... status=:applied value=95>
+```
+
+Counters are grouped by the shard that owns them, and each group is applied with the same locked read-modify-write that `increment` uses. Two batches that touch the same counter therefore both count, rather than one overwriting the other.
+
+If a shard's connection is unavailable, its counters are reported on their own while the counters on healthy shards are still applied:
+
+```ruby
+result.complete?          # => false
+result.unavailable        # => ["credits"]
+result.unavailable_shards # => [:cache_shard2]
+result.retry              # re-sends only the counters that did not land
+```
+
+Pass a `:token` to make a batch replay-safe. A receipt for the token is written in the same transaction as each counter, so sending the same batch again does not apply it twice:
+
+```ruby
+Rails.cache.adjust_multi({ "views" => 1 }, token: "order-123")  # => applied
+Rails.cache.adjust_multi({ "views" => 1 }, token: "order-123")  # => already_applied, value unchanged
+```
+
+Without a token, `Result#retry` still resends only the counters that could not be applied, because it reuses the token generated for the first call.
+
 ## Sharding the cache
 
 Solid Cache uses the [Maglev](https://static.googleusercontent.com/media/research.google.com/en//pubs/archive/44824.pdf) consistent hashing scheme to shard the cache across multiple databases.

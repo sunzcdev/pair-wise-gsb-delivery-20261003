@@ -34,6 +34,16 @@ module SolidCache
           error_handler&.call(method: method, exception: error, returning: returning)
           returning
         end
+
+        # Like +failsafe+, but hands the swallowed error back to the caller so a
+        # partial result can say which keys were left undone and why.
+        def failsafe_result(method)
+          [ yield, nil ]
+        rescue *TRANSIENT_ACTIVE_RECORD_ERRORS => error
+          ActiveSupport.error_reporter&.report(error, handled: true, severity: :warning)
+          error_handler&.call(method: method, exception: error, returning: nil)
+          [ nil, error ]
+        end
     end
   end
 end

@@ -78,6 +78,27 @@ module SolidCache
         end
       end
 
+      # Locks and reads several keys on this connection in one transaction.
+      #
+      # Yields the current payloads for +keys+ (keyed by key; a key that is not present
+      # maps to nil). The block returns a hash of payloads to write; they are written
+      # before the transaction commits, so either all of the batch's changes are visible
+      # or none of them are.
+      #
+      # Keys are locked in a stable order so concurrent batches touching the same keys
+      # cannot deadlock by taking them in different orders.
+      def locked_batch(keys)
+        transaction do
+          without_query_cache do
+            payloads = keys.sort_by { |key| key_hash_for(key) }.index_with { |key| locked_payload(key) }
+
+            writes = yield(payloads) || {}
+            writes.each { |key, payload| write(key, payload) if payload }
+            writes
+          end
+        end
+      end
+
       def id_range
         without_query_cache do
           pick(Arel.sql("max(id) - min(id) + 1")) || 0
@@ -85,6 +106,13 @@ module SolidCache
       end
 
       private
+        # The payload for +key+ while holding a row lock on it, or nil if the row does
+        # not exist yet. Uses a locking read so a concurrent writer's committed value
+        # is the one we build on.
+        def locked_payload(key)
+          lock.where(key_hash: key_hash_for(key)).pick(:key, :value)&.then { |stored_key, value| stored_key == key ? value : nil }
+        end
+
         def add_key_hash_and_byte_size(payloads)
           payloads.map do |payload|
             payload.dup.tap do |payload|

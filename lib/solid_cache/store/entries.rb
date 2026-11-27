@@ -35,6 +35,43 @@ module SolidCache
           end
         end
 
+        # Runs one locked batch per shard. Yields the group's changes, their payloads and
+        # the batch receipt payload; returns [resolutions, writes] for the group. Returns
+        # a [connection, changes, resolutions, error] tuple per shard so the caller can
+        # attribute an unavailable shard to its keys.
+        def entry_adjust_multi(changes, token:, options:)
+          receipt_key = receipt_key_for(token, options)
+
+          entry_locked_batches(changes, receipt_key: receipt_key, failsafe: :adjust_multi) do |grouped_changes, payloads, receipt_payload|
+            resolve_adjustments(grouped_changes, payloads, receipt_payload, receipt_key, token, options)
+          end
+        end
+
+        def entry_locked_batches(changes, receipt_key:, failsafe:)
+          changes_by_key = changes.index_by(&:key)
+
+          group_by_connection(changes.map(&:key)).map do |connection, keys|
+            grouped_changes = keys.map { |key| changes_by_key.fetch(key) }
+            next [ connection, grouped_changes, {}, nil ] if grouped_changes.empty?
+
+            resolutions, error = failsafe_result(failsafe) do
+              group_resolutions = nil
+
+              with_connection(connection) do
+                Entry.locked_batch(keys + [ receipt_key ]) do |payloads|
+                  group_resolutions, writes = yield(grouped_changes, payloads, payloads[receipt_key])
+                  track_writes(writes.count { |key, payload| payload && key != receipt_key })
+                  writes
+                end
+              end
+
+              group_resolutions
+            end
+
+            [ connection, grouped_changes, resolutions, error ]
+          end
+        end
+
         def entry_read(key)
           reading_key(key, failsafe: :read_entry) do
             Entry.read(key)
