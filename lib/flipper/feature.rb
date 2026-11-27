@@ -3,6 +3,7 @@ require 'flipper/type'
 require 'flipper/gate'
 require 'flipper/feature_check_context'
 require 'flipper/gate_values'
+require 'flipper/evaluation_report'
 
 module Flipper
   class Feature
@@ -126,6 +127,61 @@ module Flipper
         else
           false
         end
+      end
+    end
+
+    # Public: Explain a single feature check without changing how the check is
+    # evaluated. The gates run in their real order and short-circuit on the
+    # first open gate exactly like enabled?, so group blocks, actor properties,
+    # the clock, and random sources are only read on the branches a real check
+    # reaches; every gate after the opening one is recorded as skipped rather
+    # than evaluated a second time.
+    #
+    # actors - zero or more actors, same arguments as #enabled?.
+    # options - The Hash of options.
+    #           :clock  - optional callable used as the Now/time source instead
+    #                     of Time.now.utc.
+    #           :random - optional callable used as the Random and percentage
+    #                     of time source instead of Kernel#rand. It receives
+    #                     the same argument Random would (nil for a bare draw).
+    #
+    # Returns an Flipper::EvaluationReport whose #result equals the boolean
+    # #enabled? would return for the same actors.
+    def explain(*actors, **options)
+      wrapped_actors = wrap_actors(actors)
+      values = gate_values
+
+      report = EvaluationReport.new(
+        feature_name: @name,
+        values: values,
+        actors: wrapped_actors,
+        clock: options[:clock],
+        random: options[:random]
+      )
+
+      context = FeatureCheckContext.new(
+        feature_name: @name,
+        values: values,
+        actors: wrapped_actors,
+        report: report
+      )
+
+      instrument(:explain, thing: wrapped_actors&.first, actors: wrapped_actors) do |payload|
+        opened = false
+
+        gates.each do |gate|
+          if opened
+            report.skip_gate(gate.name, :previous_gate_open)
+            next
+          end
+
+          gate_open = gate.open?(context)
+          opened = true if gate_open
+        end
+
+        payload[:gate_name] = report.open_gate_name
+        payload[:result] = report.result
+        report
       end
     end
 

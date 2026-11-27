@@ -66,6 +66,7 @@ module Flipper
   # interface of Flipper::DSL.
   def_delegators :instance,
                  :enabled?, :enable, :disable,
+                 :explain,
                  :enable_expression, :disable_expression,
                  :expression, :add_expression, :remove_expression,
                  :enable_actor, :disable_actor,

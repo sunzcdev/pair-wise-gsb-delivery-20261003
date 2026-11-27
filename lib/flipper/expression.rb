@@ -62,6 +62,15 @@ module Flipper
       end
     end
 
+    # Internal: Detects whether an expression function takes the evaluation
+    # context as a required/optional keyword. Shared with the explanation
+    # evaluator so both paths pass context to exactly the same functions.
+    def self.function_takes_context?(function)
+      function.method(:call).parameters.any? do |type, name|
+        name == :context && [:key, :keyreq].include?(type)
+      end
+    end
+
     def eql?(other)
       other.is_a?(self.class) && @function == other.function && @args == other.args
     end
@@ -157,9 +166,7 @@ module Flipper
     private
 
     def call_with_context?
-      function.method(:call).parameters.any? do |type, name|
-        name == :context && [:key, :keyreq].include?(type)
-      end
+      Expression.function_takes_context?(function)
     end
   end
 end

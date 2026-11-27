@@ -23,14 +23,30 @@ module Flipper
       #
       # Returns true if gate open for actor, false if not.
       def open?(context)
-        return false unless context.actors?
+        unless context.actors?
+          context.report&.skip_gate(name, :no_actors)
+          return false
+        end
 
         enabled_actors = context.values.actors
-        return false if enabled_actors.empty?
 
-        context.actors.any? do |actor|
+        if enabled_actors.empty?
+          context.report&.record_gate(name, false, enabled_actors: Set.new)
+          return false
+        end
+
+        matches = context.actors.select do |actor|
           enabled_actors.include?(actor.value)
         end
+
+        result = !matches.empty?
+        context.report&.record_gate(
+          name,
+          result,
+          enabled_actors: enabled_actors,
+          matched_actors: matches.map(&:value)
+        )
+        result
       end
 
       def wrap(actor)

@@ -40,6 +40,15 @@ module Flipper
       feature(name).enabled?(*args)
     end
 
+    # Public: Explain a single feature check. See Feature#explain for the
+    # options and the returned Flipper::EvaluationReport.
+    #
+    # name - The String or Symbol name of the feature.
+    # args - The actors and options passed through to Feature#explain.
+    def explain(name, *args, **options)
+      feature(name).explain(*args, **options)
+    end
+
     # Public: Enable a feature.
     #
     # name - The String or Symbol name of the feature.

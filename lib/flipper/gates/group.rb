@@ -23,13 +23,41 @@ module Flipper
       #
       # Returns true if gate open for thing, false if not.
       def open?(context)
-        return false unless context.actors?
-
-        context.values.groups.any? do |name|
-          context.actors.any? do |actor|
-            Flipper.group(name).match?(actor, context)
-          end
+        unless context.actors?
+          context.report&.skip_gate(name, :no_actors)
+          return false
         end
+
+        group_names = context.values.groups
+
+        if group_names.empty?
+          context.report&.record_gate(name, false, groups: Set.new, checks: [])
+          return false
+        end
+
+        checks = []
+        result = group_names.any? do |group_name|
+          group = Flipper.group(group_name)
+          actor_checks = context.actors.map do |actor|
+            matched = group.match?(actor, context)
+            check = {
+              group: group_name,
+              actor: actor.value,
+              result: !!matched
+            }
+            checks << check
+            matched
+          end
+          actor_checks.any?
+        end
+
+        context.report&.record_gate(
+          name,
+          result,
+          groups: group_names,
+          checks: checks
+        )
+        result
       end
 
       def wrap(thing)

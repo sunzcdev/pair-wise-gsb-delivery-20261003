@@ -10,10 +10,16 @@ module Flipper
     # Public: The actors we want to know if a feature is enabled for.
     attr_reader :actors
 
-    def initialize(feature_name:, values:, actors:)
+    # Internal: An optional Flipper::EvaluationReport that records the gates as
+    # they are actually checked. Nil on the normal enabled? hot path, so gates
+    # pay no reporting overhead unless a caller asked for an explanation.
+    attr_reader :report
+
+    def initialize(feature_name:, values:, actors:, report: nil)
       @feature_name = feature_name
       @values = values
       @actors = actors
+      @report = report
     end
 
     def actors?

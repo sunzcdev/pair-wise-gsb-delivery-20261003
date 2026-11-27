@@ -24,9 +24,29 @@ module Flipper
       # Returns true if gate open for thing, false if not.
       def open?(context)
         percentage = context.values.percentage_of_time
-        return false if percentage <= 0
-        return true if percentage >= 100
-        rand < (percentage / 100.0)
+
+        if percentage <= 0
+          context.report&.record_gate(name, false, percentage: percentage)
+          return false
+        end
+
+        if percentage >= 100
+          context.report&.record_gate(name, true, percentage: percentage)
+          return true
+        end
+
+        threshold = percentage / 100.0
+        number = context.report ? context.report.read_random : rand
+        result = number < threshold
+
+        context.report&.record_gate(
+          name,
+          result,
+          percentage: percentage,
+          random: number,
+          threshold: threshold
+        )
+        result
       end
 
       def protects?(thing)

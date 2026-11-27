@@ -24,7 +24,9 @@ module Flipper
       # Returns true if explicitly set to true, false if explicitly set to false
       # or nil if not explicitly set.
       def open?(context)
-        context.values.boolean
+        result = !!context.values.boolean
+        context.report&.record_gate(name, result, value: context.values.boolean)
+        result
       end
 
       def wrap(thing)
