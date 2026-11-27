@@ -4,6 +4,10 @@ module SemanticLogger
   # While the process exits, it also knows which of its appenders it skips: those without a queue of
   # their own whose destination failed meanwhile, and how many log messages each has not been given
   # since (see #process_exiting=).
+  #
+  # With diagnostics: true, an appender that fails to write is reported to the other appenders, the
+  # siblings that write entries alongside it, and again when it has recovered and writes once more
+  # (see AppenderDiagnostics). The standalone internal logger still reports every failure either way.
   class Appenders < Concurrent::Array
     # An appender skipped while the process exits: the error with which its destination failed, and
     # the number of log messages it has not been given since it was last reported.
@@ -16,11 +20,23 @@ module SemanticLogger
 
     attr_accessor :logger
 
-    def initialize(logger = Processor.logger.dup)
+    # Returns [AppenderDiagnostics|nil] the diagnostics that report an appender's failure and
+    # recovery to the other appenders, when enabled, or nil otherwise.
+    attr_reader :diagnostics
+
+    # Enable, or disable, reporting an appender's failure and recovery to the other appenders (see
+    # AppenderDiagnostics). Enabling twice reuses the same diagnostics, which keeps its record of
+    # the appenders that have not yet recovered; disabling clears that record.
+    def diagnostics=(enabled)
+      @diagnostics = enabled ? (@diagnostics || AppenderDiagnostics.new) : nil
+    end
+
+    def initialize(logger = Processor.logger.dup, diagnostics: false)
       @logger      = logger
       @logger.name = self.class.name
       @exiting     = false
       @skipped     = {}.compare_by_identity
+      @diagnostics = AppenderDiagnostics.new if diagnostics
       super()
     end
 
@@ -67,6 +83,12 @@ module SemanticLogger
     # Write the log message to every appender that should log it. An appender that fails is
     # reported, and the others still write the message.
     #
+    # With diagnostics enabled, the failure is also reported to the other appenders, and an
+    # appender that has recovered, writing the message after an earlier failure, reports that too
+    # (see AppenderDiagnostics). The diagnostics are written straight to the siblings, never back
+    # through this method, so they neither take the failing appender's exit again nor recurse on
+    # the producing thread.
+    #
     # While the process exits, an appender without a queue of its own is skipped once its
     # destination has failed, and the message counted as not given to it (see #process_exiting=).
     #
@@ -86,10 +108,14 @@ module SemanticLogger
         next skipped[appender].discarded += 1 if skipped.key?(appender)
 
         appender.log(log)
+        # A write that returns has recovered from an earlier failure, if it had one. Reported only
+        # then, so an appender that never failed does nothing here.
+        diagnostics&.recovery(self, appender, logger)
       rescue SystemStackError
         raise
       rescue Exception => e
         logger.error "Failed to log to appender: #{appender.name}", e
+        diagnostics&.failure(self, appender, e, logger)
         skip_while_exiting(appender, e) if writing
       end
     end
@@ -135,6 +161,7 @@ module SemanticLogger
     ensure
       # Delete appenders outside the #each above which prevents changes during iteration.
       closed_appenders&.each { |appender| delete(appender) }
+      diagnostics&.reset
     end
 
     # After a fork, or a log rotation, reopen each appender. Called on the thread that writes to the

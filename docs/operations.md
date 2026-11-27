@@ -396,6 +396,53 @@ close then stops the thread instead of restarting it. If the worker thread ends 
 for example once it gives up, `SemanticLogger.flush` (including the flush at exit) stops waiting on
 that appender.
 
+### Diagnostics between appenders
+
+By default, when an appender cannot write a message, Semantic Logger reports the failure, with its
+exception, to the standalone internal logger (the one `SemanticLogger::Processor.logger` returns),
+and the other appenders still write the message. That keeps the report off the failing appender's
+path, but it goes to one place, typically `$stderr`, rather than to another appender that can
+retain it.
+
+Turn on appender diagnostics so that one appender's failure, and its later recovery, are also
+written to the other appenders, the siblings that write entries alongside it:
+
+~~~ruby
+SemanticLogger.diagnostics = true
+
+SemanticLogger.add_appender(io: $stdout)
+SemanticLogger.add_appender(appender: remote_appender)
+~~~
+
+Set it before the first log call, or at any time; setting it on a running processor applies to its
+appenders straight away. It is off by default, and the standalone internal logger keeps reporting
+every failure either way, so existing setups are unchanged.
+
+When an appender first fails to write, each sibling receives an `:error` entry, named
+`SemanticLogger::AppenderDiagnostics`, whose message and `payload[:appender]` name the appender at
+fault and whose `exception` is the error its write raised. The failing appender never receives its
+own report, so the report cannot take the failing exit a second time. While it stays down, the
+failure is reported once, rather than on every message. Once it writes a message again, each
+sibling receives an `:info` recovery entry naming the appender and its last error.
+
+The report is written straight to each sibling's `#log`, on the thread already writing to the
+appenders, never back through the logging pipeline. A sibling that cannot take a report does not
+start another report: the failure to write the report goes to the internal logger instead, and a
+fiber-local guard stops any report reached while another is being written on the same fiber. So the
+diagnostics stay one level deep and never recurse on the producing thread, even when the sibling is
+also failing or slow. The counts are available on the diagnostics object:
+
+~~~ruby
+diagnostics = SemanticLogger.appenders.diagnostics
+diagnostics.recursion_count   # reports the guard stopped from starting again
+diagnostics.suppressed_count  # reports a sibling could not take, sent to the internal logger
+~~~
+
+Diagnostics fan out at the point where one thread writes a message to every appender in turn, which
+covers appenders that log inline (including the in-memory test appenders) and synchronous mode. An
+appender wrapped with `async: true` or in batches writes on its own worker thread, so its own
+failures are reported by that worker to its internal logger as described above.
+
 ### When every log entry must be delivered
 
 Semantic Logger keeps the log entries it has not yet written in memory: on the queue of the thread

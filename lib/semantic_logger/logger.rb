@@ -43,14 +43,21 @@ module SemanticLogger
     def self.processor
       return RactorProcessor.current if RactorSupport.other_ractor?
 
-      @processor ||= Processor.new
+      @processor ||= Processor.new(diagnostics: SemanticLogger.diagnostics?)
     end
 
     # Switch to the synchronous processor
     def self.sync!
       return if @processor.is_a?(SyncProcessor)
 
-      @processor = SyncProcessor.new(@processor&.appenders)
+      # Keep the appenders of an existing processor, diagnostics and all; otherwise build the sync
+      # processor's own appenders with the current diagnostics setting.
+      @processor =
+        if @processor
+          SyncProcessor.new(@processor.appenders)
+        else
+          SyncProcessor.new(nil, diagnostics: SemanticLogger.diagnostics?)
+        end
     end
 
     # Running without the background logging thread?

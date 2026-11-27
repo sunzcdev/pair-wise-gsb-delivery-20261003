@@ -30,8 +30,8 @@ module SemanticLogger
 
     attr_reader :appenders
 
-    def initialize(max_queue_size: 10_000)
-      @appenders        = Appenders.new(self.class.logger.dup)
+    def initialize(max_queue_size: 10_000, diagnostics: false)
+      @appenders        = Appenders.new(self.class.logger.dup, diagnostics: diagnostics)
       # The appenders whose removal was handed over to the worker thread, and not yet done (see #remove),
       # kept here rather than only on the queue, which a forked child replaces. Takes no lock to change.
       @pending_removals = Concurrent::Array.new

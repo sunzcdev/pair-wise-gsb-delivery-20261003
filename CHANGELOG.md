@@ -7,6 +7,17 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- `SemanticLogger.diagnostics = true` reports an appender's failure to write a message to the other
+  appenders, the siblings that write entries alongside it, and its recovery once it writes again.
+  Each report is an entry named `SemanticLogger::AppenderDiagnostics`, at `:error` for a failure and
+  `:info` for a recovery, naming the appender at fault in its message and `payload[:appender]` and
+  carrying its exception. Reports are written straight to each sibling's `#log`, never back through
+  the logging pipeline, so a report never takes the failing appender's exit again; a sibling that
+  cannot take a report is reported to the standalone internal logger instead, and a fiber-local
+  guard keeps the diagnostics one level deep, so they cannot recurse on the producing thread. The
+  standalone internal logger keeps reporting every failure as before, and the feature is off by
+  default. `SemanticLogger.appenders.diagnostics` exposes the recursion and suppressed counts. See
+  [Diagnostics between appenders](https://logger.reidmorrison.com/operations.html#diagnostics-between-appenders).
 - The formatters that write a metric with its log entry also write the metric's `dimensions`:
   `:json`, `:raw`, `:fluentd`, `:ecs`, `:syslog_cee`, and `:new_relic_logs` as a `dimensions` Hash,
   `:loki` as a `dimensions` value in JSON, and `:open_telemetry` as a

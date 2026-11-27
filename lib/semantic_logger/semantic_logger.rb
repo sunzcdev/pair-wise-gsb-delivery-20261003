@@ -814,6 +814,40 @@ module SemanticLogger
     Logger.sync?
   end
 
+  # Whether an appender that fails to write is reported to the other appenders, the siblings that
+  # write entries alongside it, and again when it has recovered and writes once more.
+  #
+  # Off by default: failures are reported only to the standalone internal logger (see
+  # {Processor.logger}), as they always have been. Turn it on before the first log call, when the
+  # processor is built, so that one appender can keep the diagnostics for another's outage and
+  # recovery:
+  #
+  #   SemanticLogger.diagnostics = true
+  #   SemanticLogger.add_appender(io: $stdout)
+  #   SemanticLogger.add_appender(appender: remote_appender)
+  #
+  # The report is written straight to each sibling's #log, on the thread already writing to the
+  # appenders, never back through the logging pipeline, so it never takes the failing appender's
+  # exit again. A sibling that cannot take a report, or one reached while another report is being
+  # written on the same fiber, does not start another report: the first goes to the internal logger
+  # instead, and the recursion stays one level deep. Each report names the appender at fault and
+  # carries its exception.
+  def self.diagnostics=(diagnostics)
+    @diagnostics = diagnostics
+    # The processor may already have been built, such as after requiring "semantic_logger/sync"
+    # before setting this. Enable, or disable, the diagnostics on its appenders straight away so the
+    # setting takes effect without waiting for a new processor. Appenders live in the main Ractor;
+    # a Ractor other than it cannot change them (see RactorProcessor), so only apply it there.
+    return if RactorSupport.enabled? && RactorSupport.other_ractor?
+
+    processor = Logger.instance_variable_get(:@processor)
+    processor&.appenders&.diagnostics = diagnostics
+  end
+
+  def self.diagnostics?
+    @diagnostics == true
+  end
+
   # Initial default Level for all new instances of SemanticLogger::Logger
   @default_level         = :info
   @default_level_index   = Levels.index(@default_level)
@@ -824,6 +858,8 @@ module SemanticLogger
   @sync                  = false
   @cache_loggers         = false
   @logger_cache          = nil
+  # Off until enabled, before the first log call (see .diagnostics=).
+  @diagnostics           = false
 
   # Do not record where entries were logged, and skip only Semantic Logger's own frames.
   self.call_site_level      = nil
