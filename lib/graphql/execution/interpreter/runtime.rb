@@ -359,49 +359,58 @@ module GraphQL
         #   evaluate_selection(result_name, field_ast_nodes_or_ast_node, selections_result) -> void
         def evaluate_selection(result_name, field_ast_nodes_or_ast_node, selections_result) # rubocop:disable Metrics/ParameterLists
           return if selections_result.graphql_dead
-          # As a performance optimization, the hash key will be a `Node` if
-          # there's only one selection of the field. But if there are multiple
-          # selections of the field, it will be an Array of nodes
-          if field_ast_nodes_or_ast_node.is_a?(Array)
-            field_ast_nodes = field_ast_nodes_or_ast_node
-            ast_node = field_ast_nodes.first
-          else
-            field_ast_nodes = nil
-            ast_node = field_ast_nodes_or_ast_node
-          end
-          field_name = ast_node.name
-          owner_type = selections_result.graphql_result_type
-          field_defn = query.types.field(owner_type, field_name) || raise(GraphQL::Error, "No field definition found for #{owner_type.graphql_name}.#{field_name} (at #{ast_node.position})")
-
-          # Set this before calling `run_with_directives`, so that the directive can have the latest path
-          runtime_state = get_current_runtime_state
-          runtime_state.current_field = field_defn
-          runtime_state.current_result = selections_result
-          runtime_state.current_result_name = result_name
-
-          owner_object = selections_result.graphql_application_value
-          if field_defn.dynamic_introspection
-            owner_object = field_defn.owner.wrap(owner_object, context)
-          end
-
-          if !field_defn.any_arguments?
-            resolved_arguments = GraphQL::Execution::Interpreter::Arguments::EMPTY
-            if field_defn.extras.size == 0
-              evaluate_selection_with_resolved_keyword_args(
-                NO_ARGS, resolved_arguments, field_defn, ast_node, field_ast_nodes, owner_object, result_name, selections_result, runtime_state
-              )
+          # Associate any source requests made while resolving this field with
+          # its selection result so they can be abandoned if the branch dies
+          # (e.g. a non-null field resolves to nil).
+          prev_selection_result = @dataloader.current_selection_result
+          @dataloader.current_selection_result = selections_result
+          begin
+            # As a performance optimization, the hash key will be a `Node` if
+            # there's only one selection of the field. But if there are multiple
+            # selections of the field, it will be an Array of nodes
+            if field_ast_nodes_or_ast_node.is_a?(Array)
+              field_ast_nodes = field_ast_nodes_or_ast_node
+              ast_node = field_ast_nodes.first
             else
-              evaluate_selection_with_args(resolved_arguments, field_defn, ast_node, field_ast_nodes, owner_object, result_name, selections_result, runtime_state)
+              field_ast_nodes = nil
+              ast_node = field_ast_nodes_or_ast_node
             end
-          else
-            @query.arguments_cache.dataload_for(ast_node, field_defn, owner_object) do |resolved_arguments|
-              runtime_state = get_current_runtime_state # This might be in a different fiber
-              runtime_state.current_field = field_defn
-              runtime_state.current_arguments = resolved_arguments
-              runtime_state.current_result_name = result_name
-              runtime_state.current_result = selections_result
-              evaluate_selection_with_args(resolved_arguments, field_defn, ast_node, field_ast_nodes, owner_object, result_name, selections_result, runtime_state)
+            field_name = ast_node.name
+            owner_type = selections_result.graphql_result_type
+            field_defn = query.types.field(owner_type, field_name) || raise(GraphQL::Error, "No field definition found for #{owner_type.graphql_name}.#{field_name} (at #{ast_node.position})")
+
+            # Set this before calling `run_with_directives`, so that the directive can have the latest path
+            runtime_state = get_current_runtime_state
+            runtime_state.current_field = field_defn
+            runtime_state.current_result = selections_result
+            runtime_state.current_result_name = result_name
+
+            owner_object = selections_result.graphql_application_value
+            if field_defn.dynamic_introspection
+              owner_object = field_defn.owner.wrap(owner_object, context)
             end
+
+            if !field_defn.any_arguments?
+              resolved_arguments = GraphQL::Execution::Interpreter::Arguments::EMPTY
+              if field_defn.extras.size == 0
+                evaluate_selection_with_resolved_keyword_args(
+                  NO_ARGS, resolved_arguments, field_defn, ast_node, field_ast_nodes, owner_object, result_name, selections_result, runtime_state
+                )
+              else
+                evaluate_selection_with_args(resolved_arguments, field_defn, ast_node, field_ast_nodes, owner_object, result_name, selections_result, runtime_state)
+              end
+            else
+              @query.arguments_cache.dataload_for(ast_node, field_defn, owner_object) do |resolved_arguments|
+                runtime_state = get_current_runtime_state # This might be in a different fiber
+                runtime_state.current_field = field_defn
+                runtime_state.current_arguments = resolved_arguments
+                runtime_state.current_result_name = result_name
+                runtime_state.current_result = selections_result
+                evaluate_selection_with_args(resolved_arguments, field_defn, ast_node, field_ast_nodes, owner_object, result_name, selections_result, runtime_state)
+              end
+            end
+          ensure
+            @dataloader.current_selection_result = prev_selection_result
           end
         end
 
@@ -546,6 +555,12 @@ module GraphQL
                 set_result(parent, name_in_parent, nil, false, is_non_null_in_parent)
                 set_graphql_dead(selection_result)
               end
+              # This subtree is finished: its field just became `nil`. Release any
+              # pending source requests it made that no live branch still needs.
+              # (`set_graphql_dead` above already released this result and all its
+              # dead children; this also covers results that propagation left alive
+              # at a nullable boundary.)
+              @dataloader.release_requester(selection_result)
             elsif is_child_result
               selection_result.set_child_result(result_name, value)
             else
@@ -567,6 +582,11 @@ module GraphQL
           else
             # It's a scalar, no way to mark it dead.
           end
+          # This branch will never resolve, so abandon any source requests that
+          # only this branch is waiting for. Shared requests (also wanted by a
+          # still-live branch) are left in place. This is safe to call for
+          # scalars and results that never requested anything: it's a no-op.
+          @dataloader.release_requester(selection_result)
         end
 
         def current_path

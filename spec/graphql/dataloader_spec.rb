@@ -2005,4 +2005,118 @@ describe GraphQL::Dataloader do
       assert_equal 2, dataloader_result["data"]["foo"]["dataloaderValue"]["id"]
     end
   end
+
+  describe "abandoning pending requests from dead branches" do
+    class DeadBranchSource < GraphQL::Dataloader::Source
+      class << self
+        attr_accessor :fetched_keys
+      end
+      self.fetched_keys = []
+
+      def fetch(keys)
+        self.class.fetched_keys.concat(keys)
+        keys.map { |k| "value-#{k}" }
+      end
+    end
+
+    class DeadBranchSchema < GraphQL::Schema
+      class Thing < GraphQL::Schema::Object
+        # Non-null: returning nil kills this branch.
+        field :name, String, null: false
+
+        def name
+          if object[:failing]
+            src = context.dataloader.with(DeadBranchSource)
+            # A key only this dying branch will ever need, plus a shared key.
+            src.request("a-only")
+            src.request("shared")
+            nil # invalid nil for the non-null field
+          else
+            context.dataloader.with(DeadBranchSource).load("shared")
+          end
+        end
+      end
+
+      class Query < GraphQL::Schema::Object
+        field :a, Thing, null: true
+        field :b, Thing, null: true
+
+        def a
+          { failing: true }
+        end
+
+        def b
+          { failing: false }
+        end
+      end
+
+      query(Query)
+      use GraphQL::Dataloader
+    end
+
+    before { DeadBranchSource.fetched_keys.clear }
+
+    it "skips keys only a dead branch requested, while keeping shared reads" do
+      result = DeadBranchSchema.execute("{ a { name } b { name } }")
+
+      # Only the real non-null error is reported; branch B still works.
+      assert_equal 1, result["errors"].size
+      assert_equal ["a", "name"], result["errors"][0]["path"]
+      assert_nil result["data"]["a"]
+      assert_equal({ "name" => "value-shared" }, result["data"]["b"])
+
+      # The branch-A-only key was never read; the shared key was still fetched
+      # (once) for the live branch B.
+      assert_equal ["shared"], DeadBranchSource.fetched_keys
+    end
+
+    it "fetches normally when no branch dies" do
+      result = DeadBranchSchema.execute("{ b { name } }")
+
+      assert_nil result["errors"]
+      assert_equal({ "name" => "value-shared" }, result["data"]["b"])
+      assert_equal ["shared"], DeadBranchSource.fetched_keys
+    end
+
+    it "still surfaces real fetch errors instead of swallowing them" do
+      error_source = Class.new(GraphQL::Dataloader::Source) do
+        define_method(:fetch) do |keys|
+          raise GraphQL::Error, "boom"
+        end
+      end
+
+      schema = Class.new(GraphQL::Schema) do
+        thing_type = Class.new(GraphQL::Schema::Object) do
+          graphql_name "Thing"
+          field :name, String, null: true
+          define_method(:name) do
+            context.dataloader.with(error_source).load(object.fetch(:id))
+          end
+        end
+        query_type = Class.new(GraphQL::Schema::Object) do
+          graphql_name "Query"
+          field :thing, thing_type, null: true
+          define_method(:thing) { { id: 1 } }
+        end
+        query(query_type)
+        use GraphQL::Dataloader
+      end
+
+      # The fetch error must still be raised rather than hidden by the
+      # dead-branch cleanup (which only ever removes pending keys).
+      err = assert_raises(GraphQL::Error) do
+        schema.execute("{ thing { name } }")
+      end
+      assert_equal "boom", err.message
+    end
+
+    it "does not fetch the abandoned keys of a branch whose parent field is also non-null" do
+      # When nullability propagates all the way up, every dead result in the
+      # chain releases its requests; the live branch is unaffected.
+      result = DeadBranchSchema.execute("{ a { name } b { name } }")
+      assert_nil result["data"]["a"]
+      assert_equal({ "name" => "value-shared" }, result["data"]["b"])
+      assert_equal ["shared"], DeadBranchSource.fetched_keys
+    end
+  end
 end

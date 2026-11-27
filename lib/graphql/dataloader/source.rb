@@ -11,7 +11,13 @@ module GraphQL
         @pending = {}
         # These keys have been passed to `fetch` but haven't been finished yet
         @fetching = {}
-        # { key => result }
+        # { result_key => Set<GraphQL selection result> } tracking which branch
+        # asked for each pending key. A key stays pending only while at least one
+        # of its requesters is still active; when the last requester goes away
+        # (e.g. its branch died on a non-null error), the key is removed so it's
+        # never fetched.
+        @pending_requesters = Hash.new { |h, k| h[k] = Set.new.compare_by_identity }
+        # { result_key => Object }
         @results = {}
         @dataloader = dataloader
       end
@@ -214,6 +220,14 @@ module GraphQL
         fetch_h = @pending
         @fetching.merge!(fetch_h)
         @pending = {}
+        # These keys are now being fetched; their requester tracking is no longer
+        # needed for deciding whether to skip a load.
+        requesters_for_batch = @pending_requesters.values.flat_map(&:to_a).uniq
+        fetch_h.each_key { |k| @pending_requesters.delete(k) }
+        # Tell the dataloader to prune requesters that have no pending keys left
+        # on this source, so its registry doesn't retain entries for branches
+        # that finished normally.
+        @dataloader.prune_requesters(self, requesters_for_batch)
         results = fetch(fetch_h.values)
         idx = 0
 
@@ -227,6 +241,7 @@ module GraphQL
         fetch_h.each_key { |key|
           @results[key] = error
           @fetching.delete(key)
+          @pending_requesters.delete(key)
         }
       end
 
@@ -273,7 +288,66 @@ module GraphQL
         nil
       end
 
+      # Detach all pending keys (and their requester tracking) from this source,
+      # returning the pending `{ key => fetch_key }` hash. Used by
+      # {Dataloader#run_isolated} to park pending work for the duration of an
+      # isolated run.
+      #
+      # **Returns**
+      #
+      # - `Hash<Object, Object>`
+      def detach_pending # :nodoc:
+        pending = @pending
+        @pending = {}
+        @pending_requesters.clear
+        pending
+      end
+
+      # Re-attach a pending key previously removed by {#detach_pending}, unless
+      # it has since been loaded into the cache. Used by {Dataloader#run_isolated}.
+      #
+      # **Returns**
+      #
+      # - `void`
+      def attach_pending(key, fetch_key) # :nodoc:
+        return if @results.key?(key)
+
+        @dataloader.queue_pending_source(self) if @pending.empty?
+        @pending[key] = fetch_key
+        nil
+      end
+
       attr_reader :pending, :results
+
+      # Remove pending keys that the given requester (a GraphQL selection
+      # result) was the last remaining requester for. Keys still requested by
+      # another active requester (shared reads) and keys already being fetched
+      # are left untouched.
+      #
+      # Called by [Dataloader](rdoc-ref:Dataloader) when a selection branch is
+      # marked dead (e.g. a non-null field resolved to nil).
+      #
+      # **Returns**
+      #
+      # - `void`
+      def release_pending_keys_for(requester) # :nodoc:
+        return if @pending.empty?
+
+        orphaned_keys = nil
+        @pending.each_key do |key|
+          requesters = @pending_requesters[key]
+          requesters.delete(requester)
+          if requesters.empty?
+            @pending_requesters.delete(key)
+            (orphaned_keys ||= []) << key
+          end
+        end
+
+        if orphaned_keys
+          orphaned_keys.each { |key| @pending.delete(key) }
+        end
+        nil
+      end
 
       private
 
@@ -282,6 +356,10 @@ module GraphQL
 
         was_empty = @pending.empty?
         @pending[result_key] ||= normalize_fetch_key(value)
+        if (selection_result = @dataloader.current_selection_result) &&
+           @pending_requesters[result_key].add?(selection_result)
+          @dataloader.register_pending_source_for(selection_result, self)
+        end
         @dataloader.queue_pending_source(self) if was_empty
         true
       end

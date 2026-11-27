@@ -54,6 +54,29 @@ module GraphQL
 
       def clear_cache; end
 
+      # No source requests are batched by this dataloader, so there's nothing
+      # to track or release. These are no-ops for compatibility with the
+      # interpreter runtime's dead-branch cleanup hooks.
+      def current_selection_result
+        Fiber[:__graphql_current_selection_result]
+      end
+
+      def current_selection_result=(selection_result)
+        Fiber[:__graphql_current_selection_result] = selection_result
+      end
+
+      def register_pending_source_for(_requester, _source)
+        nil
+      end
+
+      def prune_requesters(_source, _requesters)
+        nil
+      end
+
+      def release_requester(_requester)
+        nil
+      end
+
       def yield(_source)
         raise GraphQL::Error, "GraphQL::Dataloader is not running -- add `use GraphQL::Dataloader` to your schema to use Dataloader sources."
       end

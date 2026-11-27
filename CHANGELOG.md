@@ -10,6 +10,8 @@
 
 ### Bug fixes
 
+- Dataloader: skip source requests that only a dead (non-null error) branch was waiting for, while still fetching keys shared with live branches
+
 # 2.6.16 (17 Nov 2026)
 
 ## Security

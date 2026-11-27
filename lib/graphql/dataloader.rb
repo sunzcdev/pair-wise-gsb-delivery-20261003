@@ -74,6 +74,11 @@ module GraphQL
       end
       @fiber_limit = fiber_limit
       @lazies_at_depth = Hash.new { |h, k| h[k] = [] }
+      # { GraphQL selection result => Set<Source> }: sources on which each
+      # selection branch has pending keys. When the branch is marked dead
+      # (e.g. from a non-null error), its exclusive pending keys are dropped
+      # so they're never fetched.
+      @requester_pending_sources = Hash.new { |h, k| h[k] = Set.new.compare_by_identity }
     end
 
     # **Returns**
@@ -188,6 +193,60 @@ module GraphQL
       nil
     end
 
+    # The GraphQL selection result currently being resolved by this Fiber, if
+    # any. Set by the interpreter runtime so that {Source} can associate
+    # pending requests with the branch that asked for them.
+    def current_selection_result
+      Fiber[:__graphql_current_selection_result]
+    end
+
+    def current_selection_result=(selection_result) # :nodoc:
+      Fiber[:__graphql_current_selection_result] = selection_result
+    end
+
+    # Called by {Source#request} / {Source#load} (etc) to remember that
+    # `requester` has a pending request against `source`. When the requester
+    # later goes away, {#release_requester} uses this to drop pending keys
+    # that only this requester was waiting for.
+    def register_pending_source_for(requester, source) # :nodoc:
+      @requester_pending_sources[requester].add(source)
+      nil
+    end
+
+    # Called by {Source#run_pending_keys} once `source` has consumed all its
+    # pending keys. Removes `source` from each affected requester's tracked set
+    # and drops any requester whose set is now empty, so the registry doesn't
+    # retain entries for branches that finished normally.
+    def prune_requesters(source, requesters) # :nodoc:
+      requesters.each do |requester|
+        next unless (sources = @requester_pending_sources[requester])
+
+        sources.delete(source)
+        @requester_pending_sources.delete(requester) if sources.empty?
+      end
+      nil
+    end
+
+    # Clean up pending requests belonging to a requester that has gone away.
+    #
+    # When a selection branch dies (e.g. a non-null field resolved to nil),
+    # it stops running even though it may have enqueued source requests it
+    # will never wait on. Those keys are removed from each source's pending
+    # set when this requester was their last one; keys shared with other,
+    # still-active requesters remain so the shared fetch still happens.
+    #
+    # Already-fetched results and in-flight fetches are left alone, and any
+    # real errors are still reported through the source results.
+    def release_requester(requester) # :nodoc:
+      sources = @requester_pending_sources.delete(requester)
+      return if sources.nil?
+
+      sources.each do |source|
+        source.release_pending_keys_for(requester)
+      end
+      nil
+    end
+
     # Clear any already-loaded objects from [Source](rdoc-ref:Source) caches
     #
     # **Returns**
@@ -214,8 +273,7 @@ module GraphQL
       @source_cache.each do |source_class, batched_sources|
         batched_sources.each do |batch_args, batched_source_instance|
           if batched_source_instance.pending?
-            prev_pending_keys[batched_source_instance] = batched_source_instance.pending.dup
-            batched_source_instance.pending.clear
+            prev_pending_keys[batched_source_instance] = batched_source_instance.detach_pending
           end
         end
       end
@@ -234,10 +292,7 @@ module GraphQL
       prev_pending_keys #: as !nil
         .each do |source_instance, pending|
         pending.each do |key, value|
-          next if source_instance.results.key?(key)
-
-          queue_pending_source(source_instance) if source_instance.pending.empty?
-          source_instance.pending[key] = value
+          source_instance.attach_pending(key, value)
         end
       end
     end

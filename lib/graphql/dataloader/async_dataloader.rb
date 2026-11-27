@@ -213,8 +213,7 @@ module GraphQL
         @source_cache.each do |source_class, batched_sources|
           batched_sources.each do |batch_args, batched_source_instance|
             if batched_source_instance.pending?
-              prev_pending_keys[batched_source_instance] = batched_source_instance.pending.dup
-              batched_source_instance.pending.clear
+              prev_pending_keys[batched_source_instance] = batched_source_instance.detach_pending
             end
           end
         end
@@ -233,10 +232,7 @@ module GraphQL
         prev_pending_keys = prev_pending_keys #: as !nil
         prev_pending_keys.each do |source_instance, pending|
           pending.each do |key, value|
-            next if source_instance.results.key?(key)
-
-            queue_pending_source(source_instance) if source_instance.pending.empty?
-            source_instance.pending[key] = value
+            source_instance.attach_pending(key, value)
           end
         end
       end
