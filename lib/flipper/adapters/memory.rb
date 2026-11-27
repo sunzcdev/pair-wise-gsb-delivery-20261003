@@ -1,3 +1,4 @@
+require "monitor"
 require "flipper/adapter"
 require "flipper/typecast"
 
@@ -15,7 +16,10 @@ module Flipper
       # Public
       def initialize(source = nil, threadsafe: true)
         @source = Typecast.features_hash(source)
-        @lock = Mutex.new if threadsafe
+        # A Monitor (re-entrant) so #transaction can hold the lock while the
+        # buffered batch seeds and commits through the normal get_all/import
+        # methods, which each synchronize too.
+        @lock = Monitor.new if threadsafe
         @sync_version = nil
       end
 
@@ -141,6 +145,15 @@ module Flipper
         end
 
         true
+      end
+
+      # Public: Group several changes behind the adapter lock so concurrent
+      # readers only ever see the state before or after the batch, never the
+      # in-progress writes. The buffered batch itself is not locked, so reads
+      # inside the block should go through the batch, while reads through this
+      # adapter keep returning the committed state.
+      def transaction(validate: nil)
+        synchronize { super }
       end
 
       private

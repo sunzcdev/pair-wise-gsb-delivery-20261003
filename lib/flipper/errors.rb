@@ -24,6 +24,17 @@ module Flipper
   # Raised when attempting to declare a group name that has already been used.
   class DuplicateGroup < Error; end
 
+  # Raised when a batch of grouped adapter changes fails validation. Nothing is
+  # committed, so the stored flags keep their previously committed state.
+  class InvalidBatch < Error
+    attr_reader :message
+
+    def initialize(message = "Batch of feature changes is not valid")
+      @message = message
+      super
+    end
+  end
+
   # Raised when an invalid value is set to a configuration property
   class InvalidConfigurationValue < Flipper::Error
     def initialize(message = nil)

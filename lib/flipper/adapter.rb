@@ -64,6 +64,30 @@ module Flipper
       Flipper::Exporter.build(format: format, version: version).call(self)
     end
 
+    # Public: Apply a group of changes together instead of one write at a time.
+    #
+    # The block receives an Flipper::Adapters::Batch seeded with the adapter's
+    # committed state. Writes made through the batch are buffered and stay
+    # invisible to readers using the adapter's normal get/get_multi/get_all
+    # methods (the read barrier) until the block returns. After the block, the
+    # optional validator runs against the batch's final combined state; if it
+    # raises, the whole batch is discarded and the committed flags are left
+    # untouched. Otherwise the batch is committed in one import.
+    #
+    # validate - Optional callable receiving the batch after the block runs.
+    #            Raise (e.g. Flipper::InvalidBatch) to reject the combination.
+    #
+    # Yields the Flipper::Adapters::Batch.
+    # Returns the block's return value on a successful commit.
+    # Raises if the validator rejects the final state; nothing is committed.
+    def transaction(validate: nil)
+      batch = Adapters::Batch.from(self)
+      result = yield batch
+      validate&.call(batch)
+      import(batch)
+      result
+    end
+
     # Public: Default config for a feature's gate values.
     def default_config
       self.class.default_config
@@ -119,4 +143,5 @@ end
 require "set"
 require "flipper/exporter"
 require "flipper/feature"
+require "flipper/adapters/batch"
 require "flipper/adapters/sync/synchronizer"

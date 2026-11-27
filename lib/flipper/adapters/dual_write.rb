@@ -70,6 +70,86 @@ module Flipper
           @local.disable(feature, gate, thing)
         end
       end
+
+      # Public: Flip a group of flags on both backends together. The two
+      # backends are built from the same committed state and receive the exact
+      # same buffered writes, so a release never leaves them pointing at
+      # different backends. The validator runs against the combined final state
+      # before either backend is touched; an illegal combination raises and
+      # leaves both backends on their previous gating. Reads through this
+      # adapter keep serving the committed local state until the batch commits
+      # (the read barrier).
+      def transaction(validate: nil)
+        local_batch = Adapters::Batch.from(@local)
+        remote_batch = Adapters::Batch.from(@remote)
+        batch = CompositeBatch.new(local_batch, remote_batch)
+
+        result = yield batch
+        validate&.call(batch)
+
+        @remote.import(remote_batch)
+        @local.import(local_batch)
+        result
+      end
+
+      # Internal: Routes every buffered write to an identical batch on each
+      # backend while presenting the local backend's read view, matching how
+      # DualWrite serves reads from local outside of a transaction.
+      class CompositeBatch
+        include ::Flipper::Adapter
+
+        attr_reader :local, :remote
+
+        def initialize(local, remote)
+          @local = local
+          @remote = remote
+        end
+
+        def features
+          @local.features
+        end
+
+        def get(feature)
+          @local.get(feature)
+        end
+
+        def get_multi(features)
+          @local.get_multi(features)
+        end
+
+        def get_all(**kwargs)
+          @local.get_all(**kwargs)
+        end
+
+        def read_only?
+          false
+        end
+
+        def add(feature)
+          @remote.add(feature)
+          @local.add(feature)
+        end
+
+        def remove(feature)
+          @remote.remove(feature)
+          @local.remove(feature)
+        end
+
+        def clear(feature)
+          @remote.clear(feature)
+          @local.clear(feature)
+        end
+
+        def enable(feature, gate, thing)
+          @remote.enable(feature, gate, thing)
+          @local.enable(feature, gate, thing)
+        end
+
+        def disable(feature, gate, thing)
+          @remote.disable(feature, gate, thing)
+          @local.disable(feature, gate, thing)
+        end
+      end
     end
   end
 end

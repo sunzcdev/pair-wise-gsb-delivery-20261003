@@ -75,6 +75,93 @@ RSpec.describe Flipper::Adapters::Memory do
     })
   end
 
+  describe "#transaction" do
+    let(:flipper) { Flipper.new(subject) }
+    let(:stats) { flipper[:stats] }
+    let(:search) { flipper[:search] }
+
+    it "commits a group of buffered changes in one import" do
+      subject.transaction do |batch|
+        batch.add(stats)
+        batch.enable(stats, stats.gate(:boolean), Flipper::Types::Boolean.new(true))
+      end
+
+      expect(subject.features).to eq(Set["stats"])
+      expect(subject.get(stats)[:boolean]).to eq("true")
+    end
+
+    it "keeps buffered writes invisible through the original entry until commit" do
+      subject.transaction do |batch|
+        batch.enable(stats, stats.gate(:boolean), Flipper::Types::Boolean.new(true))
+
+        expect(subject.get(stats)).to eq(subject.default_config)
+        expect(batch.get(stats)[:boolean]).to eq("true")
+      end
+
+      expect(subject.get(stats)[:boolean]).to eq("true")
+    end
+
+    it "validates the final combined state and commits when it is legal" do
+      validator = ->(batch) do
+        on = batch.get(stats)[:boolean] == "true"
+        raise Flipper::InvalidBatch, "stats must be on" unless on
+      end
+
+      subject.transaction(validate: validator) do |batch|
+        batch.enable(stats, stats.gate(:boolean), Flipper::Types::Boolean.new(true))
+      end
+
+      expect(subject.get(stats)[:boolean]).to eq("true")
+    end
+
+    it "discards the whole batch when validation fails" do
+      validator = ->(batch) do
+        raise Flipper::InvalidBatch, "stats and search cannot both be on" if
+          batch.get(stats)[:boolean] == "true" && batch.get(search)[:boolean] == "true"
+      end
+
+      expect do
+        subject.transaction(validate: validator) do |batch|
+          batch.enable(stats, stats.gate(:boolean), Flipper::Types::Boolean.new(true))
+          batch.enable(search, search.gate(:boolean), Flipper::Types::Boolean.new(true))
+        end
+      end.to raise_error(Flipper::InvalidBatch)
+
+      expect(subject.get_all).to eq({})
+    end
+
+    it "returns the block's return value" do
+      result = subject.transaction { :done }
+      expect(result).to eq(:done)
+    end
+
+    it "blocks a concurrent reader until commit so it never sees buffered writes" do
+      inside_batch = Queue.new
+      release_batch = Queue.new
+      reads = Queue.new
+
+      writer = Thread.new do
+        subject.transaction do |batch|
+          batch.enable(stats, stats.gate(:boolean), Flipper::Types::Boolean.new(true))
+          inside_batch << true
+          release_batch.pop
+        end
+      end
+
+      inside_batch.pop
+      reader = Thread.new { reads << subject.get(stats)[:boolean] }
+
+      # The reader is blocked behind the transaction lock while the batch is
+      # still open, so it cannot observe the uncommitted buffered write.
+      expect(reads.size).to eq(0)
+      release_batch << true
+      writer.join
+      reader.join
+
+      expect(reads.pop).to eq("true")
+    end
+  end
+
   it "uses its inherited Mutex safely after a fork" do
     skip "Process.fork is not supported" unless Process.respond_to?(:fork)
 
@@ -82,8 +169,8 @@ RSpec.describe Flipper::Adapters::Memory do
       require "flipper"
 
       adapter = Flipper::Adapters::Memory.new({}, threadsafe: true)
-      mutex = adapter.instance_variable_get(:@lock)
-      raise "memory adapter does not use Mutex" unless mutex.instance_of?(Mutex)
+      monitor = adapter.instance_variable_get(:@lock)
+      raise "memory adapter does not use a Monitor" unless monitor.instance_of?(Monitor)
 
       locked = Queue.new
       release = Queue.new
