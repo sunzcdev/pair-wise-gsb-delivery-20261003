@@ -205,7 +205,7 @@ module GraphQL
         run if run&.dataloader.equal?(self)
       end
 
-      def run_isolated
+      def run_isolated(merge: nil)
         previous_run = current_task_run
         prev_pending_keys = {} #: Hash[GraphQL::Dataloader::Source, Hash[untyped, untyped]]
         # Clear pending loads but keep already-cached records
@@ -218,6 +218,10 @@ module GraphQL
             end
           end
         end
+
+        # Snapshot the results that pre-date the isolated run so that only results
+        # produced inside the block can be filtered by the `merge:` selector.
+        results_before = snapshot_source_results
 
         res = nil #: untyped
         create_pending_run
@@ -239,6 +243,7 @@ module GraphQL
             source_instance.pending[key] = value
           end
         end
+        filter_isolated_results(results_before, merge) if merge
       end
 
       def run(trace_query_lazy: nil)

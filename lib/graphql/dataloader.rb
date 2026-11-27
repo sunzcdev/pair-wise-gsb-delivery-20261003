@@ -204,7 +204,27 @@ module GraphQL
     end
 
     # Use a self-contained queue for the work in the block.
-    def run_isolated
+    #
+    # Already-cached source results are shared with the block. By default, any results
+    # loaded inside the block are also shared with the outer scope when the block returns.
+    #
+    # Pass a `merge:` callable to selectively promote results from the isolated run back
+    # into the outer cache. The callable receives each `(source, key)` pair whose result was
+    # produced (or re-produced) inside the block and must return a truthy value for the
+    # result to be merged into the outer scope. Results for which the callable returns a
+    # falsey value stay inside the isolated run and are removed from the shared cache, as do
+    # failed results (which are instances of `StandardError`). Results that were already
+    # cached before the block started are never touched, so the outer cache and its pending
+    # requests remain intact.
+    #
+    # @example Only share successful results for a couple of explicitly allowed keys
+    #   dataloader.run_isolated(merge: ->(source, key) { source.is_a?(RecordSource) && ["1", "2"].include?(key) }) do
+    #     # ...extra, isolated loading...
+    #   end
+    #
+    # @param merge [#call] optional `(source, key) -> Boolean` selector controlling which
+    #   newly loaded results are kept in the shared cache after the isolated run.
+    def run_isolated(merge: nil)
       prev_queue = @pending_jobs
       prev_pending_keys = {}
       prev_lazies_at_depth = @lazies_at_depth
@@ -219,6 +239,10 @@ module GraphQL
           end
         end
       end
+
+      # Snapshot the results that pre-date the isolated run so that only results
+      # produced inside the block can be filtered by the `merge:` selector.
+      results_before = snapshot_source_results
 
       @pending_jobs = []
       res = nil #: untyped
@@ -240,6 +264,7 @@ module GraphQL
           source_instance.pending[key] = value
         end
       end
+      filter_isolated_results(results_before, merge) if merge
     end
 
     # **Parameters**
@@ -339,6 +364,46 @@ module GraphQL
     end
 
     private
+
+    # Builds a `{ source_instance => Hash of keys to results }` snapshot of every result
+    # already cached before an isolated run begins. Used to distinguish results produced
+    # inside the isolated run from results that belong to the outer scope.
+    def snapshot_source_results
+      snapshot = {} #: Hash[GraphQL::Dataloader::Source, Hash[untyped, untyped]]
+      @source_cache.each_value do |batched_sources|
+        batched_sources.each_value do |source_instance|
+          snapshot[source_instance] = source_instance.results.dup
+        end
+      end
+      snapshot
+    end
+
+    # Removes results produced during an isolated run that are not allowed to be merged
+    # back into the outer scope by `merge_selector`.
+    #
+    # A result stays in the shared cache only when all of the following hold:
+    #
+    # - it was not already cached before the isolated run (outer results are never touched);
+    # - it is not a failed result (a `StandardError` instance stored by `Source#run_pending_keys`);
+    # - the `(source, key)` pair is accepted by the given selector.
+    #
+    # Everything else is dropped from the cache, leaving it inside the isolated run only.
+    def filter_isolated_results(results_before, merge_selector)
+      @source_cache.each_value do |batched_sources|
+        batched_sources.each_value do |source_instance|
+          before = results_before[source_instance]
+          source_instance.results.each_key do |key|
+            next if before && before.key?(key)
+
+            result = source_instance.results[key]
+            if result.is_a?(StandardError) || !merge_selector.call(source_instance, key)
+              source_instance.results.delete(key)
+            end
+          end
+        end
+      end
+      nil
+    end
 
     # Returns true if anything was actually enqueued
     def enqueue_next_pending_lazies(lazies_at_depth)

@@ -1709,6 +1709,36 @@ describe GraphQL::Dataloader do
           ids.map { |_id| @count }
         end
       end
+
+      class SelectiveMergeSource < GraphQL::Dataloader::Source
+        FAILURE_KEY = :boom
+        attr_reader :fetch_calls
+
+        def initialize
+          @fetch_calls = []
+        end
+
+        def fetch(keys)
+          @fetch_calls << keys.dup
+          keys.map do |key|
+            if key == FAILURE_KEY
+              RuntimeError.new("something went wrong for #{key.inspect}")
+            else
+              "value-#{key}"
+            end
+          end
+        end
+      end
+
+      class ScopedSource < GraphQL::Dataloader::Source
+        def initialize(scope)
+          @scope = scope
+        end
+
+        def fetch(keys)
+          keys.map { |key| "#{@scope}:#{key}" }
+        end
+      end
     end
 
     it "uses its own queue" do
@@ -1775,6 +1805,111 @@ describe GraphQL::Dataloader do
       assert_equal({ a: 3 }, result)
       dl.run
       assert_equal({ a: 3, b: 3, c: 4 }, result)
+    end
+
+    it "only merges explicitly allowed successful results back into the outer scope" do
+      dl = GraphQL::Dataloader.new
+      result = {}
+
+      # The outer scope already has a cached result...
+      outer_source = dl.with(RunIsolated::SelectiveMergeSource)
+      dl.append_job { result[:outer_cached] = outer_source.load(:outer_existing) }
+      dl.run
+      assert_equal("value-outer_existing", result[:outer_cached])
+
+      # ...plus a pending request that hasn't been fetched yet.
+      outer_pending = dl.with(RunIsolated::SelectiveMergeSource).request(:outer_pending)
+
+      allowed_keys = [:allowed_key]
+      merge_selector = ->(source, key) {
+        source.is_a?(RunIsolated::SelectiveMergeSource) && allowed_keys.include?(key)
+      }
+      dl.run_isolated(merge: merge_selector) {
+        # One successful key that is allowed to be shared with the outer scope...
+        result[:allowed] = dl.with(RunIsolated::SelectiveMergeSource).load(:allowed_key)
+        # ...one successful key which must stay inside the isolated run...
+        result[:rejected] = dl.with(RunIsolated::SelectiveMergeSource).load(:rejected_key)
+        # ...and one key whose value raises an error (also kept inside).
+        result[:failed] = assert_raises(RuntimeError) {
+          dl.with(RunIsolated::SelectiveMergeSource).load(RunIsolated::SelectiveMergeSource::FAILURE_KEY)
+        }.message
+      }
+
+      assert_equal("value-allowed_key", result[:allowed])
+      assert_equal("value-rejected_key", result[:rejected])
+      assert_equal("something went wrong for :boom", result[:failed])
+
+      isolated_source = dl.with(RunIsolated::SelectiveMergeSource)
+      # Back in the outer scope, only the allowed success is present alongside
+      # the result that was cached before the isolated run.
+      assert_equal([:allowed_key, :outer_existing], isolated_source.results.keys.sort)
+      # The original cached value is untouched.
+      assert_equal("value-outer_existing", isolated_source.results[:outer_existing])
+
+      # The outer pending request was restored: running the outer queue resolves it,
+      # and the rejected/failed keys are re-fetched rather than read from a cache.
+      dl.append_job { result[:outer_pending_value] = outer_pending.load }
+      dl.append_job { result[:reloaded_rejected] = isolated_source.load(:rejected_key) }
+      dl.run
+      assert_equal("value-outer_pending", result[:outer_pending_value])
+      assert_equal("value-rejected_key", result[:reloaded_rejected])
+
+      # The rejected and failed keys never entered the outer cache.
+      refute_includes(isolated_source.results.keys, RunIsolated::SelectiveMergeSource::FAILURE_KEY)
+    end
+
+    it "keeps results from other scopes inside even when the same key appears in a parent loader" do
+      dl = GraphQL::Dataloader.new
+      result = {}
+
+      # Parent and child loaders use the same key `:shared` but through different
+      # batch parameters, so they represent different sources (different scopes).
+      parent_source = dl.with(RunIsolated::ScopedSource, :parent)
+      child_source = dl.with(RunIsolated::ScopedSource, :child)
+
+      dl.append_job { result[:parent] = parent_source.load(:shared) }
+      dl.run
+      assert_equal("parent:shared", result[:parent])
+
+      # Only a *different* key from the child scope is allowed to be shared.
+      dl.run_isolated(merge: ->(source, key) { source.equal?(child_source) && key == :exported }) {
+        result[:child_shared] = child_source.load(:shared)
+        result[:child_exported] = child_source.load(:exported)
+        # A third scope's results are never eligible for merging.
+        result[:other_scope] = dl.with(RunIsolated::ScopedSource, :other).load(:thing)
+      }
+
+      assert_equal("child:shared", result[:child_shared])
+      assert_equal("child:exported", result[:child_exported])
+      assert_equal("other:thing", result[:other_scope])
+
+      # The parent loader's original key and cache are completely unchanged...
+      assert_equal({ shared: "parent:shared" }, parent_source.results)
+      # ...the child scope only kept the explicitly exported key...
+      assert_equal({ exported: "child:exported" }, child_source.results)
+      # ...and the non-matching scope retains nothing in the outer cache.
+      assert_empty(dl.with(RunIsolated::ScopedSource, :other).results)
+
+      # Re-loading the child's non-exported key in the outer scope fetches it again.
+      dl.append_job { result[:child_shared_reload] = child_source.load(:shared) }
+      dl.run
+      assert_equal("child:shared", result[:child_shared_reload])
+    end
+
+    it "still applies the merge selector when the isolated block raises" do
+      dl = GraphQL::Dataloader.new
+      source = dl.with(RunIsolated::SelectiveMergeSource)
+
+      assert_raises(RuntimeError, "boom from isolated block") do
+        dl.run_isolated(merge: ->(_source, key) { key == :allowed_key }) do
+          source.load(:allowed_key)
+          source.load(:rejected_key)
+          raise "boom from isolated block"
+        end
+      end
+
+      # The ensure block still ran: only the allowed key remains cached.
+      assert_equal([:allowed_key], source.results.keys)
     end
   end
 
