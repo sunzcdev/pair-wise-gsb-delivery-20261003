@@ -224,6 +224,63 @@ module Bunny
     end
   end
 
+  # Raised when a connection was lost after some but not all bytes of a
+  # published message were written to the transport. The message may or may
+  # not have reached the broker, so its write result is unknown.
+  #
+  # Bunny never continues the remaining frames of such a message on another
+  # connection and never re-sends it on its own, because either would make the
+  # outcome impossible for the application to reason about.
+  #
+  # @api public
+  class IncompletePublish < Exception
+    # @return [Integer] bytes written before the transport failed
+    attr_reader :bytes_written
+    # @return [Integer] total bytes of the published message
+    attr_reader :bytes_total
+
+    def initialize(bytes_written, bytes_total)
+      @bytes_written = bytes_written
+      @bytes_total   = bytes_total
+
+      super("Connection was lost after #{bytes_written} out of #{bytes_total} bytes of a published message were written; its write result is unknown and it was not re-sent")
+    end
+  end
+
+  # Raised by {Bunny::Transport#write_for_publish} when a publish could not be
+  # written. The transport does not decide what this means for the message; the
+  # session attributes the outcome using the write progress it passed in.
+  #
+  # @private
+  class PublishWriteError < Exception
+    # @return [Exception] underlying I/O exception
+    attr_reader :reason
+
+    def initialize(reason)
+      @reason = reason
+      super(reason.message)
+    end
+  end
+
+  # Raised internally when no transport accepted any byte of a published
+  # message and the connection the message was built for is no longer in use.
+  # Such a message can be built again for the connection that replaced it.
+  #
+  # @private
+  class UnattributedPublish < Exception
+    # @return [Exception, nil] write failure that led here, if any
+    attr_reader :reason
+    # @return [Bunny::Transport] transport the message was attributed to
+    attr_reader :transport
+
+    def initialize(reason, transport)
+      @reason    = reason
+      @transport = transport
+
+      super(reason ? reason.message : "the connection was replaced before a published message was written")
+    end
+  end
+
   # Raised when RabbitMQ responds with 406 PRECONDITION_FAILED
   class PreconditionFailed < ChannelLevelException
   end

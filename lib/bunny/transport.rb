@@ -10,6 +10,7 @@ end
 
 require "bunny/exceptions"
 require "bunny/socket"
+require "bunny/publish_attempt"
 
 module Bunny
   # @private
@@ -178,6 +179,52 @@ module Bunny
           @session_error_handler.raise(Bunny::NetworkFailure.new("detected a network failure: #{e.message}", e))
         end
       end
+    end
+
+    # Writes data to the socket on behalf of a published message, reporting how
+    # many bytes the socket accepted through `progress`.
+    #
+    # Unlike {#write}, failures are not handled here: the session attributes the
+    # write outcome to the connection the message was prepared for.
+    #
+    # @param [String] data
+    # @param [Bunny::WriteProgress] progress
+    # @param [Boolean] with_timeout whether the write should honour the write timeout
+    # @raise [Bunny::PublishWriteError]
+    # @private
+    def write_for_publish(data, progress, with_timeout: true)
+      length = data.bytesize
+      raise PublishWriteError.new(ConnectionClosedError.new("pre-encoded data (#{length} bytes)")) unless open?
+
+      begin
+        if with_timeout && @write_timeout
+          @writes_mutex.synchronize do
+            @socket.write_nonblock_fully(data, @write_timeout, progress)
+          end
+        else
+          @writes_mutex.synchronize do
+            written = @socket.write(data)
+            @socket.flush
+          end
+          progress.advance(written)
+        end
+      rescue SystemCallError, Timeout::Error, Bunny::ConnectionError, IOError => e
+        # a blocking write that failed mid-buffer may have accepted some bytes
+        # with no way to tell how many, unlike the non-blocking one above
+        progress.unknown! unless with_timeout && @write_timeout
+        close
+        @status = :not_connected
+        raise PublishWriteError.new(e)
+      end
+
+      # the socket implementations short-circuit on a socket known to be at EOF
+      if progress.bytes_written < length
+        close
+        @status = :not_connected
+        raise PublishWriteError.new(IOError.new("socket accepted #{progress.bytes_written} out of #{length} bytes"))
+      end
+
+      progress.bytes_written
     end
 
     # Writes data to the socket without timeout checks

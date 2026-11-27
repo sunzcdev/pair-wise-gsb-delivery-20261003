@@ -108,9 +108,10 @@ module Bunny
       #
       # @param [String] data Data to write
       # @param [Integer] timeout Timeout
+      # @param [#advance] progress optional object that is told how many bytes the socket accepted
       #
       # @api public
-      def write_nonblock_fully(data, timeout = nil)
+      def write_nonblock_fully(data, timeout = nil, progress = nil)
         return nil if @__bunny_socket_eof_flag__
 
         length = data.bytesize
@@ -137,6 +138,7 @@ module Bunny
           end
 
           total_count += count
+          progress.advance(count) if progress
           return total_count if total_count >= length
           data = data.byteslice(count..-1)
         end

@@ -6,6 +6,7 @@ require "bunny/transport"
 require "bunny/channel_id_allocator"
 require "bunny/heartbeat_sender"
 require "bunny/reader_loop"
+require "bunny/publish_attempt"
 require "bunny/topology_registry"
 require "bunny/topology_recovery_filter"
 require "bunny/authentication/credentials_encoder"
@@ -46,6 +47,15 @@ module Bunny
 
     # @private
     DEFAULT_CONTINUATION_TIMEOUT = 15000
+
+    # How many times a message that no transport has accepted any bytes of can
+    # be prepared again for a replacement connection before the write is
+    # attributed to the latest one. A connection can be replaced while a
+    # message is being encoded, in which case the message must be encoded again
+    # against the parameters the replacement connection negotiated (its
+    # frame_max may be smaller).
+    # @private
+    MAX_PUBLISH_PREPARATIONS = 1
 
     # RabbitMQ client metadata
     DEFAULT_CLIENT_PROPERTIES = {
@@ -166,6 +176,7 @@ module Bunny
       @address_index   = 0
 
       @transport       = nil
+      @transport_generation = 0
       @user            = self.username_from(opts)
       @pass            = self.password_from(opts)
       @vhost           = self.vhost_from(opts)
@@ -1525,11 +1536,24 @@ module Bunny
       end
     end
 
-    # Sends multiple frames, in one go. For thread safety this method takes a channel
-    # object and synchronizes on it.
+    # Sends a publish frameset, in one go. For thread safety this method takes a
+    # channel object and synchronizes on it.
     #
+    # `frames` were encoded against `encoded_frame_max` before the channel was
+    # locked. The connection may have been replaced in the meantime, in which
+    # case its negotiated `frame_max` can be smaller. A message no transport has
+    # accepted any byte of is therefore encoded again through the block, against
+    # the parameters of the connection now in use. Once a transport has accepted
+    # any part of a message, a failed write raises {Bunny::IncompletePublish}:
+    # the rest of its frames are never continued on another connection and the
+    # message is never re-sent silently.
+    #
+    # @param [Array<AMQ::Protocol::Frame>] frames frames encoded against `encoded_frame_max`
+    # @param [Integer] encoded_frame_max frame_max `frames` were encoded against
+    # @param [Bunny::Channel] channel
+    # @yield [frame_max] encodes the same message against the given frame_max
     # @private
-    def send_frameset(frames, channel)
+    def send_frameset(frames, encoded_frame_max, channel, &reencoder)
       # some developers end up sharing channels between threads and when multiple
       # threads publish on the same channel aggressively, at some point frames will be
       # delivered out of order and broker will raise 505 UNEXPECTED_FRAME exception.
@@ -1539,54 +1563,165 @@ module Bunny
       # still recommend not sharing channels between threads except for consumer-only cases in the docs. MK.
       channel.synchronize do
         # see rabbitmq/rabbitmq-server#156
-        if open?
-          data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
-          @transport.write(data)
-          signal_activity!
-        else
-          raise ConnectionClosedError.new(frames)
-        end
-      end
-    end # send_frameset(frames)
+        raise ConnectionClosedError.new(frames) unless open?
 
-    # Sends multiple frames, one by one. For thread safety this method takes a channel
-    # object and synchronizes on it. Uses transport implementation that does not perform
-    # timeout control.
+        publish_to_current_connection do |attribution|
+          attribution.frameset(encoded_frame_max, frames, reencoder)
+        end
+        signal_activity!
+      end
+    end # send_frameset
+
+    # Sends a publish frameset, one by one. For thread safety this method takes a
+    # channel object and synchronizes on it. Uses transport implementation that
+    # does not perform timeout control.
     #
+    # @see #send_frameset
     # @private
-    def send_frameset_without_timeout(frames, channel)
+    def send_frameset_without_timeout(frames, encoded_frame_max, channel, &reencoder)
       # some developers end up sharing channels between threads and when multiple
       # threads publish on the same channel aggressively, at some point frames will be
       # delivered out of order and broker will raise 505 UNEXPECTED_FRAME exception.
       # If we synchronize on the channel, however, this is both thread safe and pretty fine-grained
       # locking. See a note about "single frame" methods in a comment in `send_frameset`. MK.
       channel.synchronize do
-        if open?
-          data = frames.reduce(+"") { |acc, frame| acc << frame.encode }
-          @transport.write_without_timeout(data)
-          signal_activity!
-        else
-          raise ConnectionClosedError.new(frames)
-        end
-      end
-    end # send_frameset_without_timeout(frames)
+        raise ConnectionClosedError.new(frames) unless open?
 
+        publish_to_current_connection(with_timeout: false) do |attribution|
+          attribution.frameset(encoded_frame_max, frames, reencoder)
+        end
+        signal_activity!
+      end
+    end # send_frameset_without_timeout
+
+    # Sends a batch of publish frames, encoded into a single buffer. For thread
+    # safety this method takes a channel object and synchronizes on it.
+    #
+    # The batch is attributed to the connection it gets written to, see
+    # {#send_frameset}.
+    #
+    # @param [String] data frames encoded against `encoded_frame_max`
+    # @param [Integer] encoded_frame_max frame_max `data` was encoded against
+    # @param [Bunny::Channel] channel
+    # @yield [frame_max] encodes the batch against the given frame_max
     # @private
-    def send_raw_without_timeout(data, channel)
+    def send_raw_without_timeout(data, encoded_frame_max, channel, &reencoder)
       # some developers end up sharing channels between threads and when multiple
       # threads publish on the same channel aggressively, at some point frames will be
       # delivered out of order and broker will raise 505 UNEXPECTED_FRAME exception.
       # If we synchronize on the channel, however, this is both thread safe and pretty fine-grained
       # locking. Note that "single frame" methods do not need this kind of synchronization. MK.
       channel.synchronize do
-        if open?
-          @transport.write(data)
-          signal_activity!
-        else
-          raise ConnectionClosedError.new("pre-encoded data (#{data.bytesize} bytes)")
+        raise ConnectionClosedError.new("pre-encoded data (#{data.bytesize} bytes)") unless open?
+
+        publish_to_current_connection do |attribution|
+          attribution.preencoded(encoded_frame_max, data, reencoder)
+        end
+        signal_activity!
+      end
+    end # send_raw_without_timeout
+
+    # Builds a message for the connection in use now, writes it and attributes
+    # the outcome. The block receives the {Bunny::PublishAttribution} the
+    # message is built for and returns the {Bunny::PublishAttempt} to write.
+    #
+    # When no transport accepted any byte of the message and the connection it
+    # was built for has been replaced, the block runs once more, so the message
+    # can be prepared against the parameters of the connection now in use.
+    #
+    # @private
+    def publish_to_current_connection(with_timeout: true)
+      preparations = 0
+      loop do
+        attempt = yield current_publish_attribution
+        begin
+          write_attributed_publish(attempt, with_timeout)
+          return
+        rescue UnattributedPublish => e
+          raise(e.reason || NetworkFailure.new(e.message, nil)) if preparations >= MAX_PUBLISH_PREPARATIONS
+
+          preparations += 1
         end
       end
-    end # send_raw_without_timeout(data)
+    end
+
+    # @return [Bunny::PublishAttribution] the connection in use right now
+    # @private
+    def current_publish_attribution
+      PublishAttribution.new(@transport, @transport_generation, frame_max)
+    end
+
+    # Writes a publish attempt and attributes its outcome:
+    #
+    #  * no byte written and the connection is unchanged: raises the underlying
+    #    I/O error, the message never reached a transport
+    #  * no byte written and the connection has been replaced: raises
+    #    {Bunny::UnattributedPublish}, the message can be prepared for the
+    #    connection now in use
+    #  * some bytes written: raises {Bunny::IncompletePublish}, the write result
+    #    is unknown and the rest of the message is not continued elsewhere
+    #
+    # @private
+    def write_attributed_publish(attempt, with_timeout = true)
+      progress = WriteProgress.new
+      begin
+        attempt.transport.write_for_publish(attempt.data, progress, with_timeout: with_timeout)
+      rescue PublishWriteError => e
+        attribute_failed_publish(attempt, progress, e.reason)
+      end
+    end
+
+    # @private
+    def attribute_failed_publish(attempt, progress, reason)
+      bytes_written = progress.bytes_written
+
+      if progress.unknown? || bytes_written > 0
+        # either some of the message is known to be on a connection that is
+        # gone, or it cannot be ruled out. Reporting that is more useful than
+        # any exception recovery may raise.
+        begin
+          notify_of_publish_connection_loss(reason)
+        rescue NetworkErrorWrapper
+          # single-threaded mode reports network failures this way; the write
+          # result is what the caller needs to know here
+        end
+        raise IncompletePublish.new(bytes_written, attempt.bytesize)
+      end
+
+      unless attempt.attributed_to?(current_publish_attribution)
+        # nothing was written and the connection the message was built for has
+        # been replaced already: the message can be built for the new one
+        raise UnattributedPublish.new(reason, attempt.transport)
+      end
+
+      # nothing was written and the connection is still the one the message was
+      # built for. Handling the failure may replace it, in which case the
+      # message can be built for the replacement.
+      notify_of_publish_connection_loss(reason)
+
+      unless attempt.attributed_to?(current_publish_attribution)
+        raise UnattributedPublish.new(reason, attempt.transport)
+      end
+
+      raise reason
+    end
+
+    # Runs the session-level handling of a lost connection. It never decides the
+    # outcome of the publish that was being written when the loss happened: that
+    # outcome is decided by the write attribution alone.
+    #
+    # A transport that was already closed has had its loss handled elsewhere.
+    #
+    # @private
+    def notify_of_publish_connection_loss(reason)
+      return if reason.is_a?(ConnectionClosedError)
+
+      if automatically_recover?
+        handle_network_failure(reason)
+      else
+        @session_error_handler.raise(NetworkFailure.new("detected a network failure: #{reason.message}", reason))
+      end
+    end
 
     # @return [String]
     # @api public
@@ -1780,6 +1915,9 @@ module Bunny
                                      port_from_address(address),
                                      @opts.merge(session_error_handler: @session_error_handler)
           )
+          # published messages encode the connection they belong to, so a
+          # replacement transport must not be mistaken for the one it replaced
+          @transport_generation += 1
 
           # Reset the cached progname for the logger only when no logger was provided
           @default_logger.progname = self.to_s

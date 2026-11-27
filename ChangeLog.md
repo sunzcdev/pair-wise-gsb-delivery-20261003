@@ -1,6 +1,16 @@
 ## Changes between Bunny 3.6.0 and 3.7.0 (in development)
 
-No changes yet.
+### Publish Write Attribution Across Connection Replacements
+
+A publish is now explicitly attributed to the connection it is written to.
+
+If the connection is replaced after a message was encoded but before any of it
+was handed to a transport, the message is prepared again for the replacement
+connection, which may have negotiated a smaller `frame_max`. Once a transport
+has accepted any part of a message, a failed write raises the new
+`Bunny::IncompletePublish` exception: the rest of its frames are never continued
+on another connection and the message is never re-sent silently, so the
+application can tell "never sent" apart from "write result unknown".
 
 
 ## Changes between Bunny 3.5.0 and 3.6.0 (Nov 9, 2026)

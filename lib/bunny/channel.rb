@@ -813,15 +813,10 @@ module Bunny
         end
       end
 
-      frames = AMQ::Protocol::Basic::Publish.encode(@id,
-        payload,
-        opts,
-        exchange_name,
-        routing_key,
-        opts[:mandatory],
-        false,
-        @frame_max)
-      @connection.send_frameset(frames, self)
+      frames = publish_frames_for(payload, exchange_name, routing_key, opts, @frame_max)
+      @connection.send_frameset(frames, @frame_max, self) do |frame_max|
+        publish_frames_for(payload, exchange_name, routing_key, opts, frame_max)
+      end
 
       wait_for_publish_confirm(seq_no, continuation) if continuation
 
@@ -886,19 +881,10 @@ module Bunny
       end
 
       # Encode all messages into a single buffer and write once
-      data = +""
-      payloads.each do |payload|
-        frames = AMQ::Protocol::Basic::Publish.encode(@id,
-          payload,
-          opts,
-          exchange_name,
-          routing_key,
-          opts[:mandatory],
-          false,
-          @frame_max)
-        frames.each { |frame| data << frame.encode }
+      batch_data = basic_publish_batch_data(payloads, exchange_name, routing_key, opts, @frame_max)
+      @connection.send_raw_without_timeout(batch_data, @frame_max, self) do |frame_max|
+        basic_publish_batch_data(payloads, exchange_name, routing_key, opts, frame_max)
       end
-      @connection.send_raw_without_timeout(data, self)
 
       self
     end
@@ -2670,6 +2656,31 @@ module Bunny
     end
 
     protected
+
+    # Encodes one message into publish frames against the given frame_max.
+    # @private
+    def publish_frames_for(payload, exchange_name, routing_key, opts, frame_max)
+      AMQ::Protocol::Basic::Publish.encode(@id,
+        payload,
+        opts,
+        exchange_name,
+        routing_key,
+        opts[:mandatory],
+        false,
+        frame_max)
+    end
+
+    # Encodes a batch of messages into a single buffer against the given frame_max.
+    # @private
+    def basic_publish_batch_data(payloads, exchange_name, routing_key, opts, frame_max)
+      data = +""
+      payloads.each do |payload|
+        publish_frames_for(payload, exchange_name, routing_key, opts, frame_max).each do |frame|
+          data << frame.encode
+        end
+      end
+      data
+    end
 
     # @private
     def closed!
