@@ -59,6 +59,17 @@ module Metric
         assert_in_delta 0.0125, duration
       end
 
+      it "always records a timing in seconds, whatever its duration unit is" do
+        microsecond_appender = SemanticLogger::Metric::NewRelic.new(duration_unit: :microseconds)
+        duration             = nil
+        record               = ->(_name, duration_) { duration = duration_ }
+        NewRelic::Agent.stub(:record_metric, record) do
+          microsecond_appender.info(message: amessage, metric: "User/authenticate", duration: 12.5)
+        end
+
+        assert_in_delta 0.0125, duration
+      end
+
       describe "prefix" do
         it "adds the prefix to a name that starts with its letters, but not with it and a slash" do
           assert_equal "Custom/Customers/signup", counted_name(appender, "Customers/signup")

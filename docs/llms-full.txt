@@ -514,6 +514,47 @@ logger.measure_info("Called external interface", duration: duration)
 
 Either a block or `:duration` must be supplied on every measure call.
 
+### Read the duration in another unit
+
+The measured duration is always stored on the entry in milliseconds, and `log.duration` keeps that
+millisecond reading. An appender can read the same measurement in another unit instead. Set its
+`duration_unit` to `:milliseconds` (the default), `:microseconds`, or `:seconds` (the singular,
+`:microsecond`, works too):
+
+~~~ruby
+# Sends a timing in microseconds to Statsd, while another appender keeps milliseconds.
+SemanticLogger.add_appender(metric: :statsd, duration_unit: :microseconds)
+~~~
+
+A custom appender reads it with `#duration_in`, so two appenders reconstruct the same value from one
+measurement, each in its own unit:
+
+~~~ruby
+class MicrosecondAppender < SemanticLogger::Subscriber
+  def initialize(**)
+    super(duration_unit: :microseconds, **)
+  end
+
+  def log(log)
+    duration_in(log) # the millisecond measurement expressed in microseconds
+  end
+end
+~~~
+
+`log.duration_in(:microseconds)` and `log.duration_in(:seconds)` convert the stored milliseconds
+directly; the stored value itself never changes. New Relic always records timings in seconds, so it
+ignores `duration_unit` for the value it sends.
+
+### How long an async entry waited
+
+An entry written through an async appender first waits on that appender's queue. That wait is
+measured separately from the measured duration, which is the time the block took before the entry
+was queued. The worker records it on the entry as `queue_duration` (milliseconds) just before writing
+it, so an appender can read it in its unit with `#queue_duration_in`, and the `:raw` formatter writes
+it as `queue_duration_ms`. An entry written inline by the synchronous processor has no queue wait.
+The wait never changes the measured duration, the event time, or whether the entry was logged, which
+are all decided before the entry is queued.
+
 ### All measure options
 
 The second argument to a measure call is a Hash of options:
@@ -2138,6 +2179,7 @@ destination can keep a different subset of the logs in a different format:
 | `filter` | A `Regexp` or `Proc` selecting which entries this appender accepts. See [Filtering](config.html#filtering). |
 | `application`, `environment`, `host` | Override the global values for this appender only. |
 | `metrics` | Whether to also write metric-only entries, which have a metric but no message and no exception. Defaults to `false`, except for `:kafka`, `:rabbitmq`, and `:udp`, which default to `true` until v6, and warn when it is not supplied. See [Metrics in log appenders](metrics.html#metrics-in-log-appenders). |
+| `duration_unit` | The unit this appender reads a duration in, `:milliseconds` (the default), `:microseconds`, or `:seconds`. The stored duration stays in milliseconds, so other appenders and `log.duration` are unchanged; a custom appender reads it with `#duration_in`. See [Read the duration in another unit](api.html#read-the-duration-in-another-unit). |
 
 For example, write only warnings and above to a file, formatted as JSON:
 
@@ -3799,6 +3841,20 @@ When you already have the duration, emit it on a plain log call by supplying bot
 ~~~ruby
 logger.info(message: "Called supplier", metric: "supplier/add_user", duration: 100.23)
 ~~~
+
+The duration is stored in milliseconds and the entry keeps that reading (`log.duration`). A metric
+subscriber can send the same timing in another unit with its `duration_unit` option,
+`:milliseconds` (the default), `:microseconds`, or `:seconds`:
+
+~~~ruby
+# Statsd receives the timing value in microseconds.
+SemanticLogger.add_appender(metric: :statsd, duration_unit: :microseconds)
+~~~
+
+Two subscribers with different units reconstruct the same measurement from the one entry. Statsd
+sends the timing in its `duration_unit`, and so does SignalFx for the value of its gauge. New Relic's
+agent records timings in seconds, so it always sends seconds regardless of this option; see
+[Read the duration in another unit](api.html#read-the-duration-in-another-unit).
 
 ## Step 3: Break a metric down with dimensions
 

@@ -141,6 +141,20 @@ module Metric
           assert_empty fake.counts
         end
 
+        it "sends the timing in milliseconds by default" do
+          appender.log(metric_log(duration: 1.5))
+
+          assert_equal [[metric, 1.5]], fake.timings
+        end
+
+        it "sends the same measurement in the appender's duration unit" do
+          microsecond_appender = SemanticLogger::Metric::Statsd.new(duration_unit: :microseconds)
+          microsecond_appender.instance_variable_set(:@statsd, fake)
+          microsecond_appender.log(metric_log(duration: 1.5))
+
+          assert_equal [[metric, 1_500.0]], fake.timings
+        end
+
         it "counts once by default" do
           appender.log(metric_log)
 

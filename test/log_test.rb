@@ -1187,6 +1187,87 @@ module SemanticLogger
         end
       end
 
+      describe ".duration_unit" do
+        it "accepts each supported unit in the plural and the singular" do
+          assert_equal :milliseconds, SemanticLogger::Log.duration_unit(:milliseconds)
+          assert_equal :milliseconds, SemanticLogger::Log.duration_unit(:millisecond)
+          assert_equal :microseconds, SemanticLogger::Log.duration_unit("microseconds")
+          assert_equal :microseconds, SemanticLogger::Log.duration_unit(:microsecond)
+          assert_equal :seconds, SemanticLogger::Log.duration_unit(:seconds)
+          assert_equal :seconds, SemanticLogger::Log.duration_unit("second")
+        end
+
+        it "returns nil for a value that names no unit" do
+          assert_nil SemanticLogger::Log.duration_unit(:nanoseconds)
+          assert_nil SemanticLogger::Log.duration_unit("bogus")
+          assert_nil SemanticLogger::Log.duration_unit(12)
+        end
+      end
+
+      describe ".ms_in" do
+        it "treats the millisecond as the base unit" do
+          assert_equal 1, SemanticLogger::Log.ms_in(:milliseconds)
+        end
+
+        it "counts a thousand microseconds to a millisecond and a thousand milliseconds to a second" do
+          assert_equal 1_000, SemanticLogger::Log.ms_in(:microseconds)
+          assert_in_delta 0.001, SemanticLogger::Log.ms_in(:seconds)
+        end
+
+        it "raises for an unknown unit" do
+          error = assert_raises(ArgumentError) { SemanticLogger::Log.ms_in(:weeks) }
+          assert_match(/Unknown duration unit/, error.message)
+        end
+      end
+
+      describe "#duration_in" do
+        before { log.duration = 1.5 }
+
+        it "returns nil without a duration" do
+          log.duration = nil
+
+          assert_nil log.duration_in(:microseconds)
+        end
+
+        it "keeps the millisecond reading unchanged" do
+          assert_in_delta 1.5, log.duration_in(:milliseconds)
+          assert_in_delta 1.5, log.duration
+        end
+
+        it "reads the same measurement in microseconds and seconds" do
+          assert_in_delta 1_500.0, log.duration_in(:microseconds)
+          assert_in_delta 0.0015, log.duration_in(:seconds)
+        end
+
+        it "reconstructs the same value from any unit" do
+          milliseconds = log.duration_in(:milliseconds)
+          microseconds = log.duration_in(:microseconds)
+          seconds      = log.duration_in(:seconds)
+
+          assert_in_delta milliseconds, microseconds / SemanticLogger::Log.ms_in(:microseconds)
+          assert_in_delta milliseconds, seconds / SemanticLogger::Log.ms_in(:seconds)
+        end
+      end
+
+      describe "#queue_duration and #queue_duration_in" do
+        it "has no queue duration unless one is recorded" do
+          assert_nil log.queue_duration
+          assert_nil log.queue_duration_in(:microseconds)
+        end
+
+        it "stores the queue wait in milliseconds and reads it in any unit, separately from duration" do
+          log.duration       = 1.5
+          log.queue_duration = 20.0
+
+          assert_in_delta 20.0, log.queue_duration
+          assert_in_delta 20.0, log.queue_duration_in(:milliseconds)
+          assert_in_delta 20_000.0, log.queue_duration_in(:microseconds)
+          assert_in_delta 0.02, log.queue_duration_in(:seconds)
+          # The measured duration is untouched by the queue wait.
+          assert_in_delta 1.5, log.duration
+        end
+      end
+
       describe "#level_to_s" do
         it "returns the upper case first character of the level" do
           assert_equal "I", SemanticLogger::Log.new("n", :info).level_to_s

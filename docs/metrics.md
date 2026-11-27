@@ -90,6 +90,20 @@ When you already have the duration, emit it on a plain log call by supplying bot
 logger.info(message: "Called supplier", metric: "supplier/add_user", duration: 100.23)
 ~~~
 
+The duration is stored in milliseconds and the entry keeps that reading (`log.duration`). A metric
+subscriber can send the same timing in another unit with its `duration_unit` option,
+`:milliseconds` (the default), `:microseconds`, or `:seconds`:
+
+~~~ruby
+# Statsd receives the timing value in microseconds.
+SemanticLogger.add_appender(metric: :statsd, duration_unit: :microseconds)
+~~~
+
+Two subscribers with different units reconstruct the same measurement from the one entry. Statsd
+sends the timing in its `duration_unit`, and so does SignalFx for the value of its gauge. New Relic's
+agent records timings in seconds, so it always sends seconds regardless of this option; see
+[Read the duration in another unit](api.html#read-the-duration-in-another-unit).
+
 ## Step 3: Break a metric down with dimensions
 
 Dimensions are key/value labels attached to a metric, so a backend that supports them (such as

@@ -60,8 +60,10 @@ module SemanticLogger
 
       def log(log)
         metric = log.metric
-        if (duration = log.duration)
-          @statsd.timing(metric, duration)
+        if log.duration
+          # Send the timing in this subscriber's duration unit (milliseconds by default), read from
+          # the one millisecond measurement the entry carries (see #duration_in).
+          @statsd.timing(metric, duration_in(log))
         else
           amount = log.metric_amount || 1
           # Infinity and NaN cannot be counted, whether a Float or a BigDecimal.

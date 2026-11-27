@@ -12,6 +12,12 @@ module SemanticLogger
     attr_reader :formatter
     attr_writer :application, :environment, :host, :logger, :metrics
 
+    # The unit an appender reads a duration in (see Log#duration_in), one of Log::DURATION_UNITS,
+    # such as :milliseconds (the default) or :microseconds. The stored duration is always in
+    # milliseconds regardless of this setting, which only changes how this appender reads it, so the
+    # millisecond reading and every existing duration keep their value.
+    attr_reader :duration_unit
+
     # A subscriber should implement flush if it can.
     def flush
       # NOOP
@@ -71,6 +77,32 @@ module SemanticLogger
     # Whether this log entry meets the criteria to be logged by this appender.
     def should_log?(log)
       super && (log.metric_only? ? metrics? : true)
+    end
+
+    # Sets the unit this appender reads a duration in (see #duration_unit), one of
+    # Log::DURATION_UNITS, in the singular or the plural, as a Symbol or a String. Raises
+    # ArgumentError for any other value, rather than silently keep the milliseconds default, since a
+    # misspelled unit would otherwise send metrics on the wrong scale.
+    def duration_unit=(unit)
+      @duration_unit = Log.duration_unit(unit) ||
+                       raise(ArgumentError, "Unknown duration unit: #{unit.inspect}. " \
+                                            "Use one of: #{Log::DURATION_UNITS.map(&:inspect).join(", ")}")
+    end
+
+    # Returns [Numeric] the measured duration of the supplied entry expressed in this appender's
+    # duration unit (see #duration_unit), or nil when the entry has no duration. The value an
+    # appender sends as a timing metric, so that one created with `duration_unit: :microseconds`
+    # sends microseconds while another sends milliseconds for the same entry (see Log#duration_in).
+    def duration_in(log)
+      log.duration_in(duration_unit)
+    end
+
+    # Returns [Numeric] how long the supplied entry waited on this appender's queue before it was
+    # written, in this appender's duration unit, or nil when it was not queued asynchronously (see
+    # Log#queue_duration_in). Distinct from the measured duration (#duration_in), which is not
+    # affected by the wait.
+    def queue_duration_in(log)
+      log.queue_duration_in(duration_unit)
     end
 
     # The console stream this appender writes to, if any.
@@ -340,13 +372,22 @@ module SemanticLogger
     #   metrics: [Boolean]
     #     Whether to log metric only entries with this subscriber.
     #     Default: false
+    #
+    #   duration_unit: [Symbol|String]
+    #     The unit this subscriber reads a duration in when it sends or writes it, one of
+    #     :milliseconds, :microseconds, or :seconds (the singular, :millisecond, works too). The
+    #     stored duration is always milliseconds, and the default keeps it so, so existing timings
+    #     and Log#duration are unchanged. A metric subscriber such as Statsd then sends a timing in
+    #     this unit; use #duration_in in a custom appender to read it.
+    #     Default: :milliseconds
     def initialize(level: nil, formatter: nil, filter: nil, application: nil, environment: nil, host: nil,
-                   metrics: false, &block)
-      self.formatter = block || formatter
-      @application   = application
-      @environment   = environment
-      @host          = host
-      @metrics       = metrics
+                   metrics: false, duration_unit: :milliseconds, &block)
+      self.formatter     = block || formatter
+      @application       = application
+      @environment       = environment
+      @host              = host
+      @metrics           = metrics
+      self.duration_unit = duration_unit
 
       # Subscribers don't take a class name, so use this class name if a subscriber
       # is logged to directly.

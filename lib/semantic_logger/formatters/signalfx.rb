@@ -59,7 +59,16 @@ module SemanticLogger
 
       # Value of this metric
       def value
-        hash[:value] = log.metric_amount || log.duration || 1
+        hash[:value] = log.metric_amount || duration_value || 1
+      end
+
+      # The measured duration in the appender's duration unit (see Subscriber#duration_in), falling
+      # back to the stored milliseconds when the formatter is used without such an appender, such as
+      # in a test. The default unit is milliseconds, so existing SignalFx values are unchanged.
+      def duration_value
+        return unless log.duration
+
+        logger.respond_to?(:duration_in) ? logger.duration_in(log) : log.duration
       end
 
       # Dimensions for this metric: those of the log entry that are not blank, or when it has none, the

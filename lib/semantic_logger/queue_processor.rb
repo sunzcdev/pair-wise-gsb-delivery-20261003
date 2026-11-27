@@ -3,6 +3,7 @@ require "semantic_logger/queue_processor/throttled_counter"
 require "semantic_logger/queue_processor/reporter"
 require "semantic_logger/queue_processor/backoff"
 require "semantic_logger/queue_processor/inbox"
+require "semantic_logger/queue_processor/enqueue_timing"
 require "semantic_logger/queue_processor/held_write"
 require "semantic_logger/queue_processor/batch_failure"
 require "semantic_logger/queue_processor/reopener"
@@ -93,6 +94,11 @@ module SemanticLogger
     #     unavailable; one that stopped before, such as after a fatal exception, has the retries it
     #     had left. Only the worker thread of a child process, after a fork, starts counting afresh.
     #     Default: 100
+    #
+    #   clock: [#call]
+    #     Internal. Supplies the current monotonic time in seconds, used to time how long an entry
+    #     waits on the queue (see Log#queue_duration). Defaults to the process monotonic clock. It is
+    #     injectable so a test can drive a deterministic clock; application code never passes it.
     def initialize(appender:,
                    max_queue_size: 10_000,
                    lag_check_interval: 1_000,
@@ -102,7 +108,8 @@ module SemanticLogger
                    batch_seconds: 5,
                    non_blocking: false,
                    dropped_message_report_seconds: 30,
-                   async_max_retries: 100)
+                   async_max_retries: 100,
+                   clock: -> { SemanticLogger.monotonic_time })
       @appender                       = appender
       @lag_check_interval             = lag_check_interval
       @lag_threshold_s                = lag_threshold_s
@@ -120,6 +127,7 @@ module SemanticLogger
       @processed_count                = 0
       @inbox                          = Inbox.new(max_queue_size)
       @held                           = HeldWrite.new
+      @enqueue_timing                 = EnqueueTiming.new(clock: clock)
 
       return unless batch? && !appender.respond_to?(:batch)
 
@@ -197,6 +205,12 @@ module SemanticLogger
       # Reported at most once every dropped_message_report_seconds, with whether it was dropped
       # because the worker thread has stopped for good.
       message_dropped unless enqueued
+
+      if enqueued
+        # Time the queue wait from the moment the entry is on it, so the time a thread spent waiting
+        # for room on a full queue is not part of the wait (see EnqueueTiming).
+        @enqueue_timing.mark(log)
+      end
 
       # For batches wake up the processing thread once the number of queued messages has been
       # exceeded. Also wake it on a drop so it drains the full queue rather than waiting out the
@@ -307,6 +321,8 @@ module SemanticLogger
       @inbox.recreate
       # The parent process writes the messages it held to write again.
       @held.release
+      # The child starts with an empty queue, so it inherits none of the parent's queue timings.
+      @enqueue_timing.forget
       @thread&.kill if @thread&.alive?
       # A worker thread new to this process, which has not failed to write yet.
       @backoff.restart
@@ -410,12 +426,19 @@ module SemanticLogger
     # Report to the internal logger, ignoring any error (see Reporter#log).
     def safe_log(level, message, exception = nil) = @reporter.log(level, message, exception)
 
+    # Takes the next entry off the queue, stamping a log message with how long it waited on this
+    # queue before the worker thread took it off (see EnqueueTiming). Requests and the :reopen
+    # marker carry no timing and are returned as they are.
+    def dequeue
+      queue.pop.tap { |entry| @enqueue_timing.stamp(entry) if entry.is_a?(Log) }
+    end
+
     # Streaming: write each log message to the appender as it is dequeued.
     #
     # Returns true when processing must carry on in a new thread (see #stack_overflowed).
     def process_messages
       count = 0
-      while reopen_appender && (message = queue.pop)
+      while reopen_appender && (message = dequeue)
         if message.is_a?(Log)
           gave_up = @backoff.gave_up
           next messages_failed([message], gave_up) if gave_up
@@ -464,7 +487,7 @@ module SemanticLogger
         gave_up       = @backoff.gave_up
         message_count.times do
           # Queue#pop(true) raises an exception when there are no more messages, which is considered expensive.
-          message = queue.pop
+          message = dequeue
           if message.is_a?(Log)
             next discarded << message if gave_up && commands.empty?
 

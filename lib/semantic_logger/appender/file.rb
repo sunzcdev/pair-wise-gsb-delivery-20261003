@@ -13,8 +13,12 @@ module SemanticLogger
       # With permissions, the log file is opened without following a symbolic link, so that a link
       # planted in the log directory can neither create nor open the file it points at, without
       # blocking, so that a planted FIFO fails to open instead of waiting for a reader, and without
-      # becoming the controlling terminal.
-      SECURE_OPEN_FLAGS = ::File::NOFOLLOW | ::File::NONBLOCK | ::File::NOCTTY
+      # becoming the controlling terminal. Not every flag exists on every platform, such as Windows,
+      # which has no symbolic-link or controlling-terminal open flag, so each is added only when the
+      # platform defines it.
+      SECURE_OPEN_FLAGS = %i[NOFOLLOW NONBLOCK NOCTTY].sum(0) do |flag|
+        ::File.const_defined?(flag) ? ::File.const_get(flag) : 0
+      end
       # Seconds to wait before opening a refused log file again.
       REFUSED_RETRY_INTERVAL = 5
       private_constant :SECURE_OPEN_FLAGS, :REFUSED_RETRY_INTERVAL

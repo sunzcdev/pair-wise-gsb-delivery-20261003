@@ -170,6 +170,20 @@ module SemanticLogger
           end
         end
 
+        describe "queue_duration" do
+          it "logs the queue wait in milliseconds, separate from the measured duration" do
+            log.duration       = 1.34567
+            log.queue_duration = 20.0
+
+            assert_in_delta(20.0, formatter.hash[:queue_duration_ms])
+            assert_in_delta(1.34567, formatter.hash[:duration_ms])
+          end
+
+          it "is omitted without a queue duration" do
+            refute formatter.hash.key?(:queue_duration_ms)
+          end
+        end
+
         describe "tags" do
           it "logs tags" do
             log.tags = %w[first second]

@@ -501,7 +501,7 @@ module SemanticLogger
         params  = message
         message = nil
       end
-      start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      start = SemanticLogger.monotonic_time
       begin
         if block_given?
           if (silence_level = measure_silence_level(params))
@@ -520,7 +520,7 @@ module SemanticLogger
         message     = measure_option(params, :message) || message
         duration    =
           if block_given?
-            1_000.0 * (Process.clock_gettime(Process::CLOCK_MONOTONIC) - start)
+            1_000.0 * (SemanticLogger.monotonic_time - start)
           else
             measure_option(params, :duration) ||
               raise("Mandatory block missing when :duration option is not supplied")

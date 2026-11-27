@@ -62,6 +62,7 @@ destination can keep a different subset of the logs in a different format:
 | `filter` | A `Regexp` or `Proc` selecting which entries this appender accepts. See [Filtering](config.html#filtering). |
 | `application`, `environment`, `host` | Override the global values for this appender only. |
 | `metrics` | Whether to also write metric-only entries, which have a metric but no message and no exception. Defaults to `false`, except for `:kafka`, `:rabbitmq`, and `:udp`, which default to `true` until v6, and warn when it is not supplied. See [Metrics in log appenders](metrics.html#metrics-in-log-appenders). |
+| `duration_unit` | The unit this appender reads a duration in, `:milliseconds` (the default), `:microseconds`, or `:seconds`. The stored duration stays in milliseconds, so other appenders and `log.duration` are unchanged; a custom appender reads it with `#duration_in`. See [Read the duration in another unit](api.html#read-the-duration-in-another-unit). |
 
 For example, write only warnings and above to a file, formatted as JSON:
 

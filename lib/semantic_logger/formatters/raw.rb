@@ -77,6 +77,15 @@ module SemanticLogger
         hash[:duration]    = log.duration_human
       end
 
+      # How long the entry waited on an async appender's queue before it was written, separate from
+      # the measured duration, which is the time the measured block took. Only an entry written
+      # asynchronously has one; the synchronous processor writes inline and leaves it nil.
+      def queue_duration
+        return unless log.queue_duration
+
+        hash[:queue_duration_ms] = log.queue_duration
+      end
+
       # Class / app name
       def name
         hash[:name] = log.name
@@ -136,6 +145,7 @@ module SemanticLogger
         thread_name
         file_name_and_line
         duration
+        queue_duration
         tags
         named_tags
         name

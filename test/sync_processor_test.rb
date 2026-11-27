@@ -136,6 +136,17 @@ module SemanticLogger
           assert_includes appender.events, log
         end
 
+        it "records no queue wait, since the entry is written inline rather than queued" do
+          log            = SemanticLogger::Log.new("Test", :info)
+          log.message    = "hello"
+          log.duration   = 1.5
+          processor.log(log)
+
+          assert_nil log.queue_duration
+          assert_nil log.queue_duration_in(:microseconds)
+          assert_in_delta 1.5, log.duration # the measured duration is unaffected
+        end
+
         it "reports a stack overflow instead of raising it from the log call" do
           internal    = SemanticLogger::Test::CaptureLogEvents.new
           appenders   = SemanticLogger::Appenders.new(internal)

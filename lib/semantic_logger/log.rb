@@ -71,6 +71,30 @@ module SemanticLogger
     LOG_EXCEPTION_OPTIONS = %i[full partial none].freeze
     private_constant :LOG_EXCEPTION_OPTIONS
 
+    # The units in which an appender can read a duration. The stored duration is always in
+    # milliseconds (see #duration), the unit Semantic Logger has always used, so each other unit is
+    # a fixed factor of a millisecond (see .ms_in). An appender picks one with its `duration_unit`
+    # option (see Subscriber#duration_in); the millisecond reading stays the default and is unchanged.
+    DURATION_UNITS = %i[milliseconds microseconds seconds].freeze
+
+    # The common singular spellings accepted for each unit, mapped to the DURATION_UNITS entry they
+    # name, so `:millisecond`, `:microsecond`, and `:second` work as well as the plurals.
+    DURATION_UNIT_ALIASES = {
+      millisecond: :milliseconds,
+      microsecond: :microseconds,
+      second:      :seconds
+    }.freeze
+
+    # How many of a unit make up one millisecond, the unit the stored duration uses. A millisecond
+    # is the base, so it is 1; a microsecond is smaller, so there are 1,000 in a millisecond; a
+    # second is larger, so there is 1/1,000 of one in a millisecond.
+    MILLISECONDS_PER_UNIT = {
+      milliseconds: 1,
+      microseconds: 1_000,
+      seconds:      1.0 / 1_000
+    }.freeze
+    private_constant :DURATION_UNIT_ALIASES, :MILLISECONDS_PER_UNIT
+
     # A finite real number, which #assign can compare with another one.
     REAL_NUMBER = Utils.make_shareable(->(value) { value.is_a?(Numeric) && value.real? && value.finite? })
     private_constant :REAL_NUMBER
@@ -99,7 +123,26 @@ module SemanticLogger
     # or its object id when it has none, which Ruby never reuses within a process.
     def self.thread_name_for(thread) = thread.name || thread.object_id.to_s
 
-    attr_accessor :level, :level_index, :name, :message, :time, :duration,
+    # Returns [Symbol] the duration unit the given value names, one of DURATION_UNITS, accepting the
+    # singular or plural Symbol or String, such as :microsecond, "microseconds", or :milliseconds.
+    # Returns nil for a value that names no supported unit, so an untrusted option can be checked
+    # with this and its default used instead (see Subscriber#duration_unit=).
+    def self.duration_unit(value)
+      unit = value.respond_to?(:to_sym) ? value.to_sym : value
+      unit = DURATION_UNIT_ALIASES.fetch(unit, unit)
+      unit if DURATION_UNITS.include?(unit)
+    end
+
+    # Returns [Numeric] how many of the given unit make up one millisecond, the unit a stored
+    # duration uses (see #duration). Raises ArgumentError for a unit .duration_unit does not accept.
+    def self.ms_in(unit)
+      normalized = duration_unit(unit)
+      raise(ArgumentError, "Unknown duration unit: #{unit.inspect}") unless normalized
+
+      MILLISECONDS_PER_UNIT[normalized]
+    end
+
+    attr_accessor :level, :level_index, :name, :message, :time, :duration, :queue_duration,
                   :payload, :exception, :thread_name, :backtrace, :call_site,
                   :tags, :named_tags, :context, :captures,
                   :metric, :metric_amount, :dimensions
@@ -428,6 +471,28 @@ module SemanticLogger
       else
         duration_to_s
       end
+    end
+
+    # Returns [Numeric] the measured duration (see #duration, stored in milliseconds) expressed in
+    # the given unit, or nil when the entry has no duration. The same measurement is returned in
+    # whatever unit an appender asks for, so two appenders reading milliseconds and microseconds
+    # reconstruct the same value; the millisecond reading, #duration, is unchanged. See .ms_in for
+    # the accepted units and .duration_unit for validating an untrusted one.
+    def duration_in(unit)
+      return unless duration
+
+      duration * Log.ms_in(unit)
+    end
+
+    # Returns [Numeric] how long the entry waited on the queue of the appender writing it before it
+    # was taken off, in the given unit, or nil when it did not wait asynchronously, such as an entry
+    # written inline by the synchronous processor. It is measured separately from the measured
+    # duration (see #duration_in), which is the time the measured block took, before the entry was
+    # queued, and is not changed by the wait. The stored value is in milliseconds.
+    def queue_duration_in(unit)
+      return unless queue_duration
+
+      queue_duration * Log.ms_in(unit)
     end
 
     # Returns [String] single character upper case log level

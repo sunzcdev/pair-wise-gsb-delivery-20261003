@@ -358,5 +358,50 @@ class SubscriberTest < Minitest::Test
         refute appender.message_error?(RuntimeError.new("boom"))
       end
     end
+
+    describe "#duration_unit" do
+      let(:log) do
+        SemanticLogger::Log.new("SubscriberTest", :info).tap { |entry| entry.duration = 1.5 }
+      end
+
+      it "defaults to milliseconds, so the existing reading is unchanged" do
+        assert_equal :milliseconds, appender.duration_unit
+        assert_in_delta 1.5, appender.duration_in(log)
+      end
+
+      it "reads a duration in the unit it is created with" do
+        microsecond_appender = SimpleSubscriber.new(duration_unit: :microseconds)
+
+        assert_equal :microseconds, microsecond_appender.duration_unit
+        assert_in_delta 1_500.0, microsecond_appender.duration_in(log)
+      end
+
+      it "accepts the singular and a String" do
+        assert_equal :seconds, SimpleSubscriber.new(duration_unit: "second").duration_unit
+        assert_equal :seconds, SimpleSubscriber.new(duration_unit: :seconds).duration_unit
+      end
+
+      it "can be changed after creation" do
+        appender.duration_unit = :microseconds
+
+        assert_equal :microseconds, appender.duration_unit
+        assert_in_delta 1_500.0, appender.duration_in(log)
+      end
+
+      it "raises for an unknown unit rather than keep sending milliseconds" do
+        error = assert_raises(ArgumentError) { SimpleSubscriber.new(duration_unit: :weeks) }
+        assert_match(/Unknown duration unit/, error.message)
+
+        assert_raises(ArgumentError) { appender.duration_unit = :nanosecond }
+      end
+
+      it "reads the queue wait in its unit, separately from the measured duration" do
+        log.queue_duration = 20.0
+        microsecond_appender = SimpleSubscriber.new(duration_unit: :microseconds)
+
+        assert_in_delta 20_000.0, microsecond_appender.queue_duration_in(log)
+        assert_in_delta 1_500.0, microsecond_appender.duration_in(log)
+      end
+    end
   end
 end

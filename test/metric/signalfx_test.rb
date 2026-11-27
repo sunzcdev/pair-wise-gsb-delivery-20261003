@@ -149,6 +149,23 @@ module Appender
           assert appender.should_log?(log)
         end
       end
+
+      describe "duration unit" do
+        # An appender carrying the duration unit the formatter reads through #duration_in.
+        let(:unit_appender) do
+          Class.new(SemanticLogger::Subscriber).new(duration_unit: :microseconds)
+        end
+
+        it "sends the duration in the appender's unit while keeping the milliseconds default" do
+          log.duration = 1.5
+          formatter    = SemanticLogger::Formatters::Signalfx.new(token: "TEST")
+
+          assert_in_delta 1.5, JSON.parse(formatter.call(log, appender))["gauge"].first["value"]
+
+          assert_in_delta 1_500.0,
+                          JSON.parse(formatter.call(log, unit_appender))["gauge"].first["value"]
+        end
+      end
     end
   end
 end

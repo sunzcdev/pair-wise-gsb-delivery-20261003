@@ -68,9 +68,10 @@ module SemanticLogger
 
       def log(log)
         name = format_log(log)
-        if (duration = log.duration)
-          # Convert duration to seconds
-          ::NewRelic::Agent.record_metric(name, duration / 1000.0)
+        if log.duration
+          # The agent's metric API records timings in seconds, whatever duration unit this
+          # subscriber is configured with, so read the millisecond measurement as seconds.
+          ::NewRelic::Agent.record_metric(name, log.duration_in(:seconds))
         else
           ::NewRelic::Agent.increment_metric(name, log.metric_amount || 1)
         end

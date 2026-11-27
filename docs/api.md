@@ -295,6 +295,47 @@ logger.measure_info("Called external interface", duration: duration)
 
 Either a block or `:duration` must be supplied on every measure call.
 
+### Read the duration in another unit
+
+The measured duration is always stored on the entry in milliseconds, and `log.duration` keeps that
+millisecond reading. An appender can read the same measurement in another unit instead. Set its
+`duration_unit` to `:milliseconds` (the default), `:microseconds`, or `:seconds` (the singular,
+`:microsecond`, works too):
+
+~~~ruby
+# Sends a timing in microseconds to Statsd, while another appender keeps milliseconds.
+SemanticLogger.add_appender(metric: :statsd, duration_unit: :microseconds)
+~~~
+
+A custom appender reads it with `#duration_in`, so two appenders reconstruct the same value from one
+measurement, each in its own unit:
+
+~~~ruby
+class MicrosecondAppender < SemanticLogger::Subscriber
+  def initialize(**)
+    super(duration_unit: :microseconds, **)
+  end
+
+  def log(log)
+    duration_in(log) # the millisecond measurement expressed in microseconds
+  end
+end
+~~~
+
+`log.duration_in(:microseconds)` and `log.duration_in(:seconds)` convert the stored milliseconds
+directly; the stored value itself never changes. New Relic always records timings in seconds, so it
+ignores `duration_unit` for the value it sends.
+
+### How long an async entry waited
+
+An entry written through an async appender first waits on that appender's queue. That wait is
+measured separately from the measured duration, which is the time the block took before the entry
+was queued. The worker records it on the entry as `queue_duration` (milliseconds) just before writing
+it, so an appender can read it in its unit with `#queue_duration_in`, and the `:raw` formatter writes
+it as `queue_duration_ms`. An entry written inline by the synchronous processor has no queue wait.
+The wait never changes the measured duration, the event time, or whether the entry was logged, which
+are all decided before the entry is queued.
+
 ### All measure options
 
 The second argument to a measure call is a Hash of options:

@@ -4,6 +4,32 @@ module SemanticLogger
   # Logging levels in order of most detailed to most severe
   LEVELS = Levels::LEVELS
 
+  # The clock that supplies the monotonic time every elapsed-time measurement reads: the duration a
+  # `measure_*` block took, and how long an entry waited on a queue before a worker thread wrote it
+  # (see QueueProcessor). It is a callable returning the current monotonic time in seconds.
+  #
+  # The default reads the process monotonic clock, which never moves backwards, unlike wall-clock
+  # time, so both timings survive the system clock being changed. It is replaceable as a whole,
+  # rather than per thread, so a test can install one controlled clock that the worker threads of
+  # the async appenders read too; restore the default afterwards (see #reset_monotonic_clock).
+  # Application code leaves it alone.
+  @monotonic_clock = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+
+  class << self
+    # The callable supplying the current monotonic time in seconds (see #monotonic_time).
+    attr_accessor :monotonic_clock
+  end
+
+  # The current monotonic time, in seconds, from the configured clock (see .monotonic_clock).
+  def self.monotonic_time
+    @monotonic_clock.call
+  end
+
+  # Restores the process monotonic clock after a test replaced .monotonic_clock.
+  def self.reset_monotonic_clock
+    @monotonic_clock = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+  end
+
   # Return a logger for the supplied class or class_name.
   #
   # When `SemanticLogger.cache_loggers` is enabled (opt-in, default off) and a
