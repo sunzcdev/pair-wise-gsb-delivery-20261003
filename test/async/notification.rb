@@ -47,4 +47,32 @@ describe Async::Notification do
 	end
 	
 	it_behaves_like Async::ACondition
+	
+	with "notification receipts" do
+		let(:receipt) {notification.receipt}
+		
+		it "settles the receipt when the deferred notification is transferred" do
+			task = reactor.async do
+				notification.wait
+			end
+			
+			expect(notification.signal(:value, receipt: receipt)).to be == true
+			
+			# The notification is delivered on the next iteration of the reactor:
+			expect(receipt.states).to be == [Async::Condition::Receipt::WAITING]
+			expect(receipt).not.to be(:settled?)
+			
+			expect(task.wait).to be == :value
+			
+			expect(receipt.states).to be == [Async::Condition::Receipt::SIGNALLED]
+			expect(receipt).to be(:settled?)
+		end
+		
+		it "settles the receipt immediately when there is nothing to notify" do
+			expect(notification.signal(:value, receipt: receipt)).to be == false
+			
+			expect(receipt).to be(:settled?)
+			expect(receipt.states).to be == []
+		end
+	end
 end

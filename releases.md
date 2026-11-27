@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+  - `Async::Condition#signal` now accepts an optional `receipt:` which reports the outcome of the notification round for every waiter registered at the time of the call. Each waiter is reported as `:signalled` (it received the value), `:cancelled` (it was cancelled before it received the value), or `:re_registered` (it received the value and registered for the next notification). Waiters which register after the round started are bound to the next notification and are not included in the receipt. Waiting on a receipt is independent of the waiters, so cancelling the observing task does not disturb them. The existing return values of `signal` and the behaviour of `wait` are unchanged. The same `receipt:` parameter is supported by `Async::Notification#signal`.
+
 ## v2.46.0
 
   - Fixed `Thread#kill` raising a `TypeError` while shutting down a thread with an active `Async::Reactor`.

@@ -11,26 +11,36 @@ module Async
 	class Notification < Condition
 		# Signal to a given task that it should resume operations.
 		#
+		# The notification is delivered on the next iteration of the reactor. Fibers which register after this call are bound to the next notification.
+		#
+		# @parameter value [Object | Nil] The value to return to the waiting fibers.
+		# @parameter receipt [Receipt | Boolean | Nil] An optional receipt, or `true` to allocate one (see {#last_receipt}).
+		# @yields {|receipt| ...} The receipt for this round, if a block is given.
 		# @returns [Boolean] if a task was signalled.
-		def signal(value = nil)
-			return false if empty?
+		def signal(value = nil, receipt: nil, &block)
+			receipt = self.prepare_receipt(receipt, block_given?)
 			
-			Fiber.scheduler.push Signal.new(self.exchange, value)
+			if round = self.exchange(receipt)
+				Fiber.scheduler.push Signal.new(round, value)
+			else
+				# There were no waiters, so this round is already settled:
+				receipt&.settle!
+				
+				return false
+			end
+			
+			yield(receipt) if block_given?
 			
 			return true
 		end
 		
-		Signal = Struct.new(:ready, :value) do
+		Signal = Struct.new(:round, :value) do
 			def alive?
 				true
 			end
 			
 			def transfer
-				ready.num_waiting.times do
-					ready.push(value)
-				end
-				
-				ready.close
+				round.deliver(value)
 			end
 		end
 		
