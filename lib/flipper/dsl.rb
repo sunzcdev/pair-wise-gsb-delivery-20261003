@@ -283,6 +283,25 @@ module Flipper
       adapter.read_only?
     end
 
+    # Public: Builds a read-only compatibility plan for importing the given
+    # source (a DSL, adapter or export) into this instance's adapter. The plan
+    # lists which features migrate in full and which ones rely on gates the
+    # target cannot store; nothing is written.
+    #
+    # Returns a Flipper::Adapters::Sync::CompatibilityPlan.
+    def import_compatibility_plan(source)
+      Adapters::Sync::CompatibilityPlan.new(adapter, source)
+    end
+
+    # Public: Imports only the features the target adapter can fully express,
+    # following the same compatibility range as #import_compatibility_plan.
+    # Features that need unsupported gates keep their existing target settings.
+    #
+    # Returns the Flipper::Adapters::Sync::CompatibilityPlan that was applied.
+    def import_compatible(source)
+      import_compatibility_plan(source).apply
+    end
+
     # Cloud DSL method that does nothing for open source version.
     def sync
     end

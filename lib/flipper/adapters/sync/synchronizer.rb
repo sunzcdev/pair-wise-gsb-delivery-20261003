@@ -3,6 +3,7 @@ require "flipper/gate_values"
 require "flipper/adapters/actor_limit"
 require "flipper/adapters/strict"
 require "flipper/adapters/sync/feature_synchronizer"
+require "flipper/adapters/sync/compatibility_plan"
 
 module Flipper
   module Adapters

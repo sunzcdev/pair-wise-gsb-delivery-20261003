@@ -74,6 +74,7 @@ module Flipper
                  :enable_percentage_of_time, :disable_percentage_of_time,
                  :features, :feature, :[], :preload, :preload_all,
                  :adapter, :adapter_stack, :add, :exist?, :remove, :import, :export,
+                 :import_compatibility_plan, :import_compatible,
                  :memoize=, :memoizing?, :read_only?,
                  :sync, :sync_secret # For Flipper::Cloud. Will error for OSS Flipper.
 
@@ -208,6 +209,7 @@ require 'flipper/adapters/actor_limit'
 require 'flipper/adapters/instrumented'
 require 'flipper/adapters/memoizable'
 require 'flipper/adapters/memory'
+require 'flipper/adapters/limited'
 require 'flipper/adapters/strict'
 require 'flipper/adapter_builder'
 require 'flipper/configuration'
