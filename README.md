@@ -27,6 +27,7 @@ Solid Queue can be used with SQL databases such as MySQL, PostgreSQL, or SQLite,
 - [Lifecycle hooks](#lifecycle-hooks)
 - [Errors when enqueuing](#errors-when-enqueuing)
 - [Concurrency controls](#concurrency-controls)
+  - [Changing concurrency keys](#changing-concurrency-keys)
   - [Performance considerations](#performance-considerations)
 - [Failed jobs and retries](#failed-jobs-and-retries)
   - [Error reporting on jobs](#error-reporting-on-jobs)
@@ -595,6 +596,46 @@ Note that the `duration` setting depends indirectly on the value for `concurrenc
 Jobs are unblocked in order of priority but **queue order is not taken into account for unblocking jobs**. That means that if you have a group of jobs that share a concurrency group but are in different queues, or jobs of the same class that you enqueue in different queues, the queue order you set for a worker is not taken into account when unblocking blocked ones. The reason is that a job that runs unblocks the next one, and the job itself doesn't know about a particular worker's queue order (you could even have different workers with different queue orders), it can only know about priority. Once blocked jobs are unblocked and available for polling, they'll be picked up by a worker following its queue order.
 
 Finally, failed jobs that are automatically or manually retried work in the same way as new jobs that get enqueued: they get in the queue for getting an open semaphore, and whenever they get it, they'll be run. It doesn't matter if they had already gotten an open semaphore in the past.
+
+### Changing concurrency keys
+
+You might need to change how a job's concurrency key is computed—for example, replacing keys derived from the job class and a user with an explicit `group` shared by several job classes—while jobs limited by the old keys are still running or blocked. Solid Queue stores the computed key on each job when it's enqueued, and a job that gets a concurrency slot records the exact semaphore it got it from, so the two sides of the change move independently:
+
+- **New enqueues** compute their key from the current `limits_concurrency` declaration, so they're admitted under the new policy as soon as you deploy it.
+- **Jobs already running** give their slots back to the semaphore they got them from, under their original key, no matter how the declaration has changed since. They never release a position into the wrong group.
+
+What remains is folding the jobs still waiting under the old keys into the new group, with a data migration right after deploying the new declaration:
+
+```ruby
+old_keys = [ "MovePostings/123", "RebundlePostings/123" ] # the keys being merged
+new_key  = "ContactActions/123"                           # the key the new declaration computes
+limit    = 1                                              # the new `to`
+duration = 15.minutes                                     # the new `duration`
+
+SolidQueue::Job.transaction do
+  # Slots handed out under these keys sit with ready and claimed jobs
+  held = SolidQueue::Job.where(finished_at: nil, concurrency_key: old_keys + [ new_key ])
+    .where(id: SolidQueue::ReadyExecution.select(:job_id))
+    .or(SolidQueue::Job.where(finished_at: nil, concurrency_key: old_keys + [ new_key ]).where(id: SolidQueue::ClaimedExecution.select(:job_id)))
+    .count
+
+  # Move every unfinished job—running, blocked or scheduled—into the new group
+  SolidQueue::Job.where(finished_at: nil, concurrency_key: old_keys).update_all(concurrency_key: new_key)
+  SolidQueue::BlockedExecution.where(concurrency_key: old_keys).update_all(concurrency_key: new_key)
+
+  # Open the group's semaphore with the slots still out already debited
+  semaphore = SolidQueue::Semaphore.create_or_find_by!(key: new_key, expires_at: duration.from_now)
+  semaphore.update!(value: limit - held, expires_at: duration.from_now)
+end
+```
+
+The seeded value can be zero or even negative when the old keys have more slots out than the new limit allows: that's the group carrying the occupancy of the keys it absorbed. From there, the transition is strictly one-way and never admits extra concurrency:
+
+- Jobs that got their slots under the old keys signal their original semaphores when they finish, so they don't open positions in the new group. The old semaphores simply expire and are cleaned up by the regular concurrency maintenance.
+- Jobs admitted under the new key signal the group's semaphore, which never goes above the new `limit`.
+- While the group's semaphore is still debited, blocked jobs wait—even when a legacy job finishes—and are released one at a time as positions genuinely free up or the semaphore expires, whatever comes first.
+
+Skipping the migration means the new key starts with a fresh semaphore, so jobs under it can run on top of everything the old keys still have in flight, momentarily exceeding the limit you intended.
 
 ### Scheduled jobs
 
