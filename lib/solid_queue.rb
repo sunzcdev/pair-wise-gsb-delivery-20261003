@@ -43,6 +43,11 @@ module SolidQueue
 
   mattr_accessor :preserve_finished_jobs, default: true
   mattr_accessor :clear_finished_jobs_after, default: 1.day
+  # How long a finished batch referenced by a callback job that hasn't been
+  # consumed yet is kept, regardless of clear_finished_jobs_after, so the
+  # callback can still read the batch's final state when a worker picks it up.
+  # Past this period the reference counts as stale and no longer holds cleanup.
+  mattr_accessor :clear_finished_batches_with_pending_callbacks_after, default: 1.day
   mattr_accessor :default_concurrency_control_period, default: 3.minutes
 
   mattr_reader :time_zone

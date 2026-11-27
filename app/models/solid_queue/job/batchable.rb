@@ -12,11 +12,35 @@ module SolidQueue
         after_create :create_batch_execution, if: :batched?
         after_update :update_batch_progress, if: :batched?
         before_destroy :destroy_batch_execution, if: :batched?
+
+        # A job is enqueued but not yet done with while it sits in any of the
+        # execution tables: ready, scheduled, blocked waiting on concurrency or
+        # claimed by a worker. Once it finishes or fails it's no longer coming
+        # back to its batch, so it stops counting as a reference.
+        scope :awaiting_execution, -> {
+          where(id: ReadyExecution.select(:job_id))
+            .or(where(id: ScheduledExecution.select(:job_id)))
+            .or(where(id: BlockedExecution.select(:job_id)))
+            .or(where(id: ClaimedExecution.select(:job_id)))
+        }
       end
 
       class_methods do
         def batch_all(jobs)
           BatchExecution.create_all_from_jobs(jobs) if Batch.migrated?
+        end
+
+        # Callback jobs don't belong to the batch they report on, so they carry
+        # its id in their serialized arguments under
+        # ActiveJob::BatchId::CALLBACK_BATCH_ID_KEY instead of in their batch_id.
+        # Prefilter in SQL and then parse the arguments, so a key that only
+        # shows up nested in a job's own payload is never read as a reference.
+        def callback_batch_ids_referenced_by(jobs)
+          reference = "%\"#{ActiveJob::BatchId::CALLBACK_BATCH_ID_KEY}\"%"
+
+          jobs.where("arguments LIKE ?", reference).pluck(:arguments)
+            .filter_map { |arguments| arguments[ActiveJob::BatchId::CALLBACK_BATCH_ID_KEY] }
+            .compact.uniq
         end
       end
 

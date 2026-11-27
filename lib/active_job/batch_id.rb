@@ -6,6 +6,12 @@ module ActiveJob
   module BatchId
     extend ActiveSupport::Concern
 
+    # Keys used in the serialized job data. Callback jobs don't belong to the
+    # batch they report on, so they only keep a reference to it, which the
+    # batch cleanup reads to know which finished batches are still needed.
+    BATCH_ID_KEY = "batch_id"
+    CALLBACK_BATCH_ID_KEY = "callback_batch_id"
+
     included do
       attr_accessor :batch_id
       attr_accessor :callback_batch_id

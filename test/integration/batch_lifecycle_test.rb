@@ -378,6 +378,78 @@ class BatchLifecycleTest < ActiveSupport::TestCase
     assert_equal 5, SolidQueue::Batch.failed.count
   end
 
+  # Three same-age finished batches: one with no callback, one whose callback
+  # job is enqueued but hasn't been picked up by a worker, and one whose
+  # callback was never enqueued. Only the last two references are live while
+  # the callback can still be read, so only they get held back.
+  test "clearing batches keeps those a pending callback still reads" do
+    unread_callback_job = UnreadCallbackJob.new
+    no_callback = SolidQueue::Batch.enqueue
+    pending_callback = SolidQueue::Batch.enqueue(on_finish: BatchOnSuccessJob.new("held"))
+    stale_callback = SolidQueue::Batch.enqueue(on_finish: BatchOnSuccessJob.new("stale"))
+
+    [ no_callback, pending_callback, stale_callback ].each do |batch|
+      batch.update_columns(finished_at: 2.days.ago, enqueued_at: 2.days.ago)
+    end
+
+    # The pending callback job is enqueued and waiting for a worker.
+    SolidQueue::Batch.enqueue(on_success: unread_callback_job)
+
+    assert_equal [ no_callback.id ], SolidQueue::Batch.clearable(finished_before: 1.day.ago).pluck(:id)
+
+    assert_no_difference -> { SolidQueue::Batch.count }, +1 do
+      SolidQueue::Batch.clear_finished_in_batches(finished_before: 1.day.ago)
+    end
+
+    assert_not SolidQueue::Batch.exists?(id: no_callback.id)
+    assert SolidQueue::Batch.exists?(id: pending_callback.id)
+    assert SolidQueue::Batch.exists?(id: stale_callback.id)
+  end
+
+  test "a callback job that runs after its batch is cleared would miss it" do
+    batch = SolidQueue::Batch.enqueue(on_finish: ReadBatchJob.new)
+    batch.update_columns(finished_at: 2.days.ago, enqueued_at: 2.days.ago)
+
+    callback_job = SolidQueue::Job.find_by!(class_name: ReadBatchJob.name)
+    assert_equal batch.id, callback_job.arguments["callback_batch_id"]
+
+    SolidQueue::Batch.clear_finished_in_batches(finished_before: 1.day.ago)
+
+    assert SolidQueue::Batch.exists?(id: batch.id)
+
+    # Run the callback for real, as a worker would: it must still read the
+    # batch's final state.
+    SolidQueue::ReadyExecution.claim([ ReadBatchJob.queue_name ], 1, nil).sole.tap do |execution|
+      assert_nothing_raised { execution.perform }
+    end
+
+    assert_equal "batch #{batch.id}: 0 jobs succeeded!", JobBuffer.last_value
+  end
+
+  test "clearing waits for a pending callback only until its deadline" do
+    on_time = SolidQueue::Batch.enqueue(on_finish: ReadBatchJob.new)
+    [ on_time ].each { |batch| batch.update_columns(finished_at: 2.days.ago, enqueued_at: 2.days.ago) }
+
+    callback_job = SolidQueue::Job.find_by!(class_name: ReadBatchJob.name)
+    callback_job.update_columns(created_at: 2.days.ago)
+
+    assert_equal [ on_time.id ], SolidQueue::Batch.clearable(finished_before: 1.day.ago, pending_callbacks_for: 1.day).pluck(:id)
+
+    SolidQueue::Batch.clear_finished_in_batches(finished_before: 1.day.ago, pending_callbacks_for: 1.day)
+    assert_not SolidQueue::Batch.exists?(id: on_time.id)
+  end
+
+  test "a callback that already ran does not hold its batch" do
+    batch = SolidQueue::Batch.enqueue(on_finish: ReadBatchJob.new)
+    batch.update_columns(finished_at: 2.days.ago, enqueued_at: 2.days.ago)
+
+    SolidQueue::ReadyExecution.claim([ ReadBatchJob.queue_name ], 1, nil).sole.perform
+
+    assert_includes SolidQueue::Batch.clearable(finished_before: 1.day.ago), batch
+    SolidQueue::Batch.clear_finished_in_batches(finished_before: 1.day.ago)
+    assert_not SolidQueue::Batch.exists?(id: batch.id)
+  end
+
   class OnFinishJob < ApplicationJob
     queue_as :background
 

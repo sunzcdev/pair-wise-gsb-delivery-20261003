@@ -454,6 +454,7 @@ There are several settings that control how Solid Queue works that you can set a
 - `supervisor_pidfile`: path to a pidfile that the supervisor will create when booting to prevent running more than one supervisor in the same host, or in case you want to use it for a health check. It's `nil` by default.
 - `preserve_finished_jobs`: whether to keep finished jobs in the `solid_queue_jobs` table—defaults to `true`.
 - `clear_finished_jobs_after`: period to keep finished jobs around, in case `preserve_finished_jobs` is true — defaults to 1 day. When installing Solid Queue, [a recurring job](#recurring-tasks) is automatically configured to clear finished jobs every hour on the 12th minute in batches. You can edit the `recurring.yml` configuration to change this as you see fit.
+- `clear_finished_batches_with_pending_callbacks_after`: period a [finished batch](#clearing-batches) referenced by a callback job that hasn't run yet is kept when clearing batches, regardless of `clear_finished_jobs_after` — defaults to 1 day. After that the reference is considered stale and the batch gets cleared as usual.
 - `default_concurrency_control_period`: the value to be used as the default for the `duration` parameter in [concurrency controls](#concurrency-controls). It defaults to 3 minutes.
 
 ### Validating the configuration
@@ -798,6 +799,10 @@ clear_solid_queue_finished_batches:
   command: "SolidQueue::Batch.clear_finished_in_batches(sleep_between_batches: 0.3)"
   schedule: every hour at minute 12
 ```
+
+Clearing never removes a batch a job still needs. A batch with outstanding jobs isn't finished, so it isn't cleared, and a callback job that's enqueued but hasn't been picked up by a worker yet keeps the written batch it reports on. The callback loads the batch when it runs, and clearing it earlier would leave the callback without the state it's meant to read. Batches with no callbacks, and those whose callbacks have already run, are cleared as usual.
+
+A reference only holds its batch while it can still be consumed. Callback jobs still waiting to run—ready, scheduled or blocked on concurrency—keep their batch for up to `config.solid_queue.clear_finished_batches_with_pending_callbacks_after` (one day by default) since they were enqueued, so cleanup stays bounded even if a callback job never gets to run. After that period the reference counts as stale, and the batch is cleared like any other, as is a batch whose callback was never enqueued at all. Failed callback jobs already ran, so they don't hold their batch either.
 
 ### Upgrading existing installations
 
