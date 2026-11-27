@@ -1045,7 +1045,108 @@ module ROM
           wrap_around(*others)
         end
 
+        # Batch-check associations and report a status for every tuple
+        #
+        # Maintenance scripts often use `combine` to verify associations, but
+        # a regular `combine` cannot tell a NULL foreign key apart from a
+        # foreign key that points at a tuple which no longer exists - both
+        # simply produce a `nil` association. It also requires the keys used
+        # for matching to be present in the projection.
+        #
+        # This method batch-loads the matching keys and the associated tuples
+        # in separate queries, so projections remain free to hide the keys
+        # used for matching, and extends every returned tuple with an
+        # `<assoc>_status` entry set to one of:
+        #
+        #   * `:ok`             - the foreign key is set and its target exists
+        #   * `:missing_key`    - the foreign key is NULL
+        #   * `:missing_target` - the foreign key is set but its target is gone
+        #
+        # @example
+        #   tasks.select(:title).combine_check(:user)
+        #   # [
+        #   #   { title: "Joe's task",  user_status: :ok },
+        #   #   { title: "Jane's task", user_status: :missing_key },
+        #   #   { title: "Jade's task", user_status: :missing_target }
+        #   # ]
+        #
+        # @param [Array<Symbol>] assoc_names A list of many-to-one association names
+        #
+        # @return [Array<Hash>] Tuples extended with association statuses
+        #
+        # @raise [ArgumentError] if an association is not a many-to-one
+        #
+        # @api public
+        def combine_check(*assoc_names)
+          pk = schema.primary_key_name
+
+          unless pk
+            raise ArgumentError, "combine_check requires #{name.relation} to have a primary key"
+          end
+
+          assocs = assoc_names.map { |assoc_name| __checkable_assoc__(assoc_name) }
+
+          projected_pk = schema.key?(pk)
+          source = projected_pk ? self : select_append(pk)
+
+          tuples = source.to_a.map(&:to_h)
+
+          assocs.each do |assoc|
+            statuses = __assoc_statuses__(source, assoc, pk)
+
+            tuples.each do |tuple|
+              tuple[:"#{assoc.key}_status"] = statuses.fetch(tuple[pk])
+            end
+          end
+
+          projected_pk ? tuples : tuples.each { |tuple| tuple.delete(pk) }
+        end
+
         private
+
+        # Return a many-to-one association or raise
+        #
+        # @api private
+        def __checkable_assoc__(assoc_name)
+          associations[assoc_name].tap do |assoc|
+            unless assoc.is_a?(Associations::ManyToOne)
+              raise ArgumentError,
+                    "combine_check doesn't support #{assoc.class} " \
+                    "(#{assoc_name.inspect}), only many-to-one associations can be checked"
+            end
+          end
+        end
+
+        # Batch-load matching keys and existing target keys for an association
+        # and return a primary key => status map
+        #
+        # @api private
+        def __assoc_statuses__(source, assoc, pk)
+          fk, target_pk = assoc.combine_keys.first
+
+          fk_by_pk = source.dataset.select(pk, fk).to_h { |row| [row[pk], row[fk]] }
+          target_keys = __existing_assoc_keys__(assoc, target_pk, fk_by_pk.values)
+
+          fk_by_pk.transform_values do |value|
+            if value.nil?
+              :missing_key
+            elsif target_keys.include?(value)
+              :ok
+            else
+              :missing_target
+            end
+          end
+        end
+
+        # Return target keys that still exist for the given foreign key values
+        #
+        # @api private
+        def __existing_assoc_keys__(assoc, target_pk, fks)
+          fks = fks.compact.uniq
+          return EMPTY_ARRAY if fks.empty?
+
+          assoc.target.where(target_pk => fks).pluck(target_pk)
+        end
 
         # Build a locking clause
         #

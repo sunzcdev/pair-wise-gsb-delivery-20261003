@@ -1,6 +1,8 @@
 - version: 3.8.0
   summary:
   date: unreleased
+  added:
+  - "`Relation#combine_check` batch-loads many-to-one associations for maintenance checks and reports a per-tuple status (`:ok`, `:missing_key` or `:missing_target`), so NULL foreign keys can be told apart from dangling ones even when the projection hides the keys used for matching"
   fixed:
   - "Use dataset to fetch record after insert so that read types are properly applied in Create command (@katafrakt)"
   changed:
