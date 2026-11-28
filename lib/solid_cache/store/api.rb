@@ -105,10 +105,14 @@ module SolidCache
 
         def write_multi_entries(entries, expires_in: nil, **options)
           if entries.any?
-            serialized_entries = serialize_entries(entries, **options)
+            # All the entries in a batch share a single clock reading, no
+            # matter which shard they are written to or how long
+            # serialization takes.
+            written_at = Time.now
+            serialized_entries = serialize_entries(entries, expires_in: expires_in, written_at: written_at, **options)
             # to add them to the local cache
-            serialized_entries.each do |entries|
-              write_serialized_entry(entries[:key], entries[:value])
+            serialized_entries.each do |entry|
+              write_serialized_entry(entry[:key], entry[:value])
             end
 
             entry_write_multi(serialized_entries).all?
@@ -127,10 +131,23 @@ module SolidCache
           super(entry, raw: raw, **options)
         end
 
-        def serialize_entries(entries, **options)
+        def serialize_entries(entries, expires_in: nil, written_at: nil, **options)
           entries.map do |key, entry|
-            { key: key, value: serialize_entry(entry, **options) }
+            entry = entry_with_batch_expiry(entry, expires_in: expires_in, written_at: written_at)
+            { key: key, value: serialize_entry(entry, **options), expires_at: entry.expires_at }
           end
+        end
+
+        # Entries that carry their own expiry (for example a shorter TTL
+        # chosen by the caller) keep it. Any other entry falls back to the
+        # batch's +expires_in+, measured from the batch's shared +written_at+
+        # clock reading rather than from whenever each shard's SQL runs.
+        def entry_with_batch_expiry(entry, expires_in: nil, written_at: nil)
+          if expires_in && written_at && entry.expires_at.nil?
+            entry = entry.dup
+            entry.expires_at = written_at + expires_in
+          end
+          entry
         end
 
         def deserialize_entry(payload, **)

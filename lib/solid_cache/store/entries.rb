@@ -57,10 +57,20 @@ module SolidCache
 
         def entry_write_multi(entries)
           writing_keys(entries, failsafe: :write_multi_entries, failsafe_returning: false) do |entries|
-            Entry.write_multi(entries)
-            track_writes(entries.count)
-            true
+            # Checked as late as possible, just before each shard's SQL
+            # write: entries that have already expired are dropped so the
+            # late write can't overwrite a live value stored in the meantime.
+            unexpired_entries = entries.reject { |entry| expired_payload?(entry) }
+            if unexpired_entries.any?
+              Entry.write_multi(unexpired_entries.map { |entry| entry.except(:expires_at) })
+              track_writes(unexpired_entries.count)
+            end
+            unexpired_entries.count == entries.count
           end
+        end
+
+        def expired_payload?(payload)
+          payload[:expires_at] && payload[:expires_at] <= Time.now.to_f
         end
 
         def entry_delete(key)
