@@ -239,6 +239,7 @@ module GraphQL
             variables: query.provided_variables,
             context: query.context.to_h,
             operation_name: query.operation_name,
+            schema_version: query.context.namespace(:subscriptions)[:schema_version],
           }
         end
       end

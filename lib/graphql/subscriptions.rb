@@ -23,6 +23,105 @@ module GraphQL
     class SubscriptionScopeMissingError < GraphQL::Error
     end
 
+    # A registry of {GraphQL::Subscriptions} instances by the `schema_version:`
+    # they were configured with. When two versions of a schema run side-by-side
+    # (for example, while old subscriptions are still receiving updates),
+    # persisted subscription data remembers which version it was validated with,
+    # and this registry routes updates to the instance for that version --
+    # even if the new schema reuses the same field names.
+    #
+    # **Returns**
+    #
+    # - `Hash{Object => GraphQL::Subscriptions}` — Registered instances, keyed by schema version
+    def self.schema_version_registry
+      if self.equal?(GraphQL::Subscriptions)
+        @schema_version_registry ||= {}
+      else
+        GraphQL::Subscriptions.schema_version_registry
+      end
+    end
+
+    # Register `subscriptions` as the manager for `schema_version`.
+    # (This happens automatically when a subscriptions instance is created with `schema_version:`.)
+    #
+    # **Parameters**
+    #
+    # - `version` (`Object`) — The version identifier, eg `"v1"` or a `String` digest
+    # - `subscriptions` (`GraphQL::Subscriptions`) — The instance managing subscriptions for that version
+    #
+    # **Returns**
+    #
+    # - `void`
+    def self.register_schema_version(version, subscriptions)
+      schema_version_registry[version] = subscriptions
+      nil
+    end
+
+    # **Parameters**
+    #
+    # - `version` (`Object`) — A previously-registered schema version
+    #
+    # **Returns**
+    #
+    # - `GraphQL::Subscriptions, nil` — The instance registered for `version`, if any
+    def self.subscriptions_for_schema_version(version)
+      schema_version_registry[version]
+    end
+
+    # Retire `version`: from now on, updates for subscriptions that were
+    # validated with `version` will be terminated instead of executed.
+    # See [terminate_retired_subscription](rdoc-ref:#terminate_retired_subscription).
+    #
+    # **Parameters**
+    #
+    # - `version` (`Object`) — The schema version to retire
+    # - `reason` (`String, nil`) — A termination reason, passed through to `terminate_retired_subscription`
+    #
+    # **Returns**
+    #
+    # - `void`
+    def self.retire_schema_version(version, reason: nil)
+      retired_schema_versions[version] = reason || "Schema version #{version.inspect} was retired"
+      nil
+    end
+
+    # **Parameters**
+    #
+    # - `version` (`Object`) — A schema version
+    #
+    # **Returns**
+    #
+    # - `String, nil` — The retirement reason for `version`, or `nil` if it hasn't been retired
+    def self.retired_schema_version_reason(version)
+      retired_schema_versions[version]
+    end
+
+    # Forget all registered and retired schema versions. (Mostly useful in tests.)
+    #
+    # **Returns**
+    #
+    # - `void`
+    def self.reset_schema_versions!
+      if self.equal?(GraphQL::Subscriptions)
+        @schema_version_registry = {}
+        @retired_schema_versions = {}
+      else
+        GraphQL::Subscriptions.reset_schema_versions!
+      end
+      nil
+    end
+
+    # **Returns**
+    #
+    # - `Hash{Object => String}` — Retired schema versions and their termination reasons
+    def self.retired_schema_versions
+      if self.equal?(GraphQL::Subscriptions)
+        @retired_schema_versions ||= {}
+      else
+        GraphQL::Subscriptions.retired_schema_versions
+      end
+    end
+
     # See [GraphQL::Subscriptions](rdoc-ref:GraphQL::Subscriptions) for the base options; concrete implementations may add options.
     def self.use(defn, options = {})
       schema = defn.is_a?(Class) ? defn : defn.target
@@ -41,17 +140,31 @@ module GraphQL
     #
     # - `schema` (`Class`) — the GraphQL schema this manager belongs to
     # - `validate_update` (`Boolean`) — If false, then validation is skipped when executing updates
+    # - `schema_version` (`Object`) — An identifier for the version of `schema` this instance serves.
+    #   When two versions of a schema run in parallel, persisted subscription data remembers
+    #   the version it was validated with, so updates are executed by the instance
+    #   registered for that version instead of being migrated to a new schema
+    #   that happens to reuse the same field names.
     #
     # :call-seq:
-    #   initialize(Class schema:, bool validate_update:, broadcast:, default_broadcastable:, **rest)
-    def initialize(schema:, validate_update: true, broadcast: false, default_broadcastable: false, **rest)
+    #   initialize(Class schema:, bool validate_update:, broadcast:, default_broadcastable:, schema_version:, **rest)
+    def initialize(schema:, validate_update: true, broadcast: false, default_broadcastable: false, schema_version: nil, **rest)
       if broadcast
         schema.query_analyzer(Subscriptions::BroadcastAnalyzer)
       end
       @default_broadcastable = default_broadcastable
       @schema = schema
       @validate_update = validate_update
+      @schema_version = schema_version
+      if !schema_version.nil?
+        GraphQL::Subscriptions.register_schema_version(schema_version, self)
+      end
     end
+
+    # **Returns**
+    #
+    # - `Object` — The version identifier this instance was configured with, if any
+    attr_reader :schema_version
 
     # **Returns**
     #
@@ -135,6 +248,28 @@ module GraphQL
         return nil
       end
 
+      stored_version = query_data[:schema_version]
+      if !stored_version.nil? && stored_version != @schema_version
+        # This subscription was validated with another version of the schema.
+        # Don't migrate it to this schema -- even if this schema reuses the
+        # same field names -- instead, hand it off to the instance registered
+        # for its own version, or terminate it if that version was retired.
+        if (retirement_reason = GraphQL::Subscriptions.retired_schema_version_reason(stored_version))
+          terminate_retired_subscription(subscription_id, stored_version, retirement_reason)
+          return nil
+        elsif (version_owner = GraphQL::Subscriptions.subscriptions_for_schema_version(stored_version))
+          return version_owner.execute_update(subscription_id, event, object)
+        else
+          # No instance is registered for that version in this process;
+          # leave the subscription alone so its own process can update it.
+          return nil
+        end
+      elsif !@schema_version.nil? && (retirement_reason = GraphQL::Subscriptions.retired_schema_version_reason(@schema_version))
+        # This instance's own version was retired; terminate its subscriptions.
+        terminate_retired_subscription(subscription_id, @schema_version, retirement_reason)
+        return nil
+      end
+
       # Fetch the required keys from the saved data
       query_string = query_data.fetch(:query_string)
       variables = query_data.fetch(:variables)
@@ -155,6 +290,8 @@ module GraphQL
       execute_options[:validate] = validate_update?(**execute_options)
       result = @schema.execute(**execute_options)
       subscriptions_context = result.context.namespace(:subscriptions)
+      # Tag the result with the version that produced it:
+      subscriptions_context[:schema_version] = @schema_version
       if subscriptions_context[:no_update]
         result = nil
       end
@@ -294,6 +431,29 @@ module GraphQL
       raise GraphQL::RequiredImplementationMissingError
     end
 
+    # Called when an update arrives for a subscription whose persisted
+    # `schema_version` has been retired (see [retire_schema_version](rdoc-ref:.retire_schema_version)).
+    # By default, the subscription is deleted. Override this to notify the
+    # client first -- `version` and `reason` identify the retired schema version
+    # that this subscription was validated with.
+    #
+    # **Parameters**
+    #
+    # - `subscription_id` (`String`)
+    # - `version` (`Object`) — The retired schema version the subscription belongs to
+    # - `reason` (`String`) — The reason given when the version was retired
+    #
+    # **Returns**
+    #
+    # - `void`
+    #
+    # :call-seq:
+    #   terminate_retired_subscription(String subscription_id, Object version, String reason) -> void
+    def terminate_retired_subscription(subscription_id, version, reason)
+      delete_subscription(subscription_id)
+      nil
+    end
+
     # **Returns**
     #
     # - `String` — A new unique identifier for a subscription
@@ -355,6 +515,9 @@ module GraphQL
       subs_namespace = query.context.namespace(:subscriptions)
       subs_namespace[:events] = []
       subs_namespace[:subscriptions] = {}
+      # Remember which schema version this subscription is validated with,
+      # so that persisted data can be routed to the right version later:
+      subs_namespace[:schema_version] = @schema_version
       nil
     end
 

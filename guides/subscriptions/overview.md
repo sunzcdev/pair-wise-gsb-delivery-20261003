@@ -43,3 +43,7 @@ By default, the subscription implementations listed above handle each subscripti
 ## Multi-Tenant
 
 See the [Multi-tenant guide](/subscriptions/multi_tenant) for supporting multi-tenancy in GraphQL subscriptions.
+
+## Schema Versions
+
+See the [Schema Versions guide](/subscriptions/schema_versions) for running two versions of a schema in parallel while old subscriptions keep receiving updates.
