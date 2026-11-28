@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+- Enhancement: `Shoryuken::Worker::InlineExecutor` gains an opt-in, time-bounded FIFO deduplication observation so
+  CI/local inline runs suppress the same re-executions a FIFO queue drops in production
+  - `InlineExecutor.enable_fifo_deduplication!` (optionally `window:` and `clock:`) records each submission carrying a
+    `message_deduplication_id` under the queue it is actually submitted to, its `message_group_id` and its
+    `message_deduplication_id`; a repeat inside the window (SQS's five-minute `DeduplicationDuration` by default) returns
+    an `InlineExecutor::SuppressedMessage` instead of running the worker
+  - `disable_fifo_deduplication!`, `reset_fifo_deduplication!`, `fifo_deduplication?`, `observed_deduplication_keys` and
+    `observed_deduplication_count` configure the observation and report which scopes actually executed
+  - Observation is off by default, so ordinary (non-FIFO) inline jobs and submissions without a
+    `message_deduplication_id` keep running every time; `perform_in` shares the observation and the window only advances
+    with time, not with the ignored delay interval
+
 - Fix: `perform_async`, `perform_in` and `perform_at` of a raw worker with several queues (an Array, or a lambda that
   returns several) raise an `ArgumentError` that names the worker and its queues and asks for `queue:` when called
   without `queue:`
