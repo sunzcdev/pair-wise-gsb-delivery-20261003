@@ -181,6 +181,47 @@ statsd = Datadog::Statsd.new('localhost', 8125, buffer_max_payload_size: 4096)
 statsd.close()
 ```
 
+### Short-window counter aggregation
+
+By default every metric is buffered and sent independently. When you produce a
+lot of counters, you can opt in to short-window aggregation with
+`counter_aggregation: true`:
+
+```ruby
+statsd = Datadog::Statsd.new('localhost', 8125, counter_aggregation: true)
+```
+
+Within a flush window (i.e. between two buffer flushes), counter metrics are
+merged together **only** when they share:
+
+* the same metric name,
+* an equivalent tag set,
+* the same sample rate.
+
+The deltas of the merged counters are simply added, and a single counter
+message is emitted per group on flush. Every other metric type (gauges,
+histograms, timings, sets, distributions, events, service checks) and any
+counter call made on a client without this option keeps being sent directly,
+untouched.
+
+```ruby
+statsd.batch do |s|
+  s.increment('page.views', tags: ['env:prod'])
+  s.increment('page.views', tags: ['env:prod'])
+  s.count('page.views', 3, tags: ['env:prod'], sample_rate: 0.5)
+  s.gauge('page.views', 42)
+end
+# flushed packet:
+#   page.views:2|c|#env:prod
+#   page.views:3|c|@0.5|#env:prod
+#   page.views:42|g
+```
+
+The option is opt-in and disabled by default, so existing clients are not
+affected. It composes with `single_thread`, `delay_serialization` and the
+buffer size/pool limits: an aggregation window that grows past
+`buffer_max_payload_size` is flushed and a new window is opened.
+
 ## Threading model
 
 Starting with version 5.0, `dogstatsd-ruby` employs a new threading model where one instance of `Datadog::Statsd` can be shared between threads and where data sending is non-blocking (asynchronous).

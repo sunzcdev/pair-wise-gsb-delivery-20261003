@@ -8,6 +8,7 @@ require_relative 'statsd/uds_connection'
 require_relative 'statsd/connection_cfg'
 require_relative 'statsd/origin_detection'
 require_relative 'statsd/message_buffer'
+require_relative 'statsd/counter_aggregator'
 require_relative 'statsd/serialization'
 require_relative 'statsd/sender'
 require_relative 'statsd/single_thread_sender'
@@ -83,6 +84,7 @@ module Datadog
     # @option [Float] default sample rate if not overridden
     # @option [Boolean] single_thread flushes the metrics on the main thread instead of in a companion thread
     # @option [Boolean] delay_serialization delays stat serialization
+    # @option [Boolean] counter_aggregation merges, within a flush window, counters sharing the same metric name, tag set and sample rate (other metric types are always sent as-is)
     # @option [Boolean] origin_detection is origin detection enabled
     # @option [String] container_id the container ID field, used for origin detection
     # @option [String] cardinality the default tag cardinality to use
@@ -106,6 +108,7 @@ module Datadog
 
       single_thread: false,
       delay_serialization: false,
+      counter_aggregation: false,
 
       telemetry_enable: true,
       telemetry_flush_interval: DEFAULT_TELEMETRY_FLUSH_INTERVAL,
@@ -160,6 +163,8 @@ module Datadog
         container_id: container_id,
         external_data: external_data,
         cardinality: @cardinality,
+
+        counter_aggregation: counter_aggregation,
 
         serializer: serializer
       )

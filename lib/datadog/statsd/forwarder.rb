@@ -26,6 +26,8 @@ module Datadog
         external_data: nil,
         cardinality: nil,
 
+        counter_aggregation: false,
+
         serializer:
       )
         @transport_type = connection_cfg.transport_type
@@ -60,7 +62,8 @@ module Datadog
           max_payload_size: buffer_max_payload_size,
           max_pool_size: buffer_max_pool_size || DEFAULT_BUFFER_POOL_SIZE,
           overflowing_stategy: buffer_overflowing_stategy,
-          serializer: serializer
+          serializer: serializer,
+          counter_aggregation: counter_aggregation
         )
 
         sender_queue_size ||= 1 if single_thread
