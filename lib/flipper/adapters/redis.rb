@@ -148,7 +148,121 @@ module Flipper
         true
       end
 
+      # Public: Replaces one member of a set gate with another as one atomic
+      # server-side change.
+      #
+      # A small Lua script checks the members, then removes the old member and
+      # adds the new one in the same step. No other client can observe the set
+      # without the old member and before the new one exists, two clients
+      # cannot interleave into a set that is missing a member neither asked to
+      # remove, and the set never grows when the change is a swap.
+      #
+      # The script validates the caller's expected members against the set it
+      # is about to change, so a client working from a stale member list
+      # changes nothing and gets Flipper::ActorSetConflict, while the client
+      # whose members still match applies the change. That is what makes two
+      # concurrent replacements deterministic across processes.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        ensure_not_reserved_key!(feature)
+        unsupported_data_type(gate.data_type) unless gate.data_type == :set
+
+        prefix = "#{gate.key}/"
+        expected_members = normalize_expected_members(expected)
+        argv = [prefix, old_thing.value.to_s, new_thing.value.to_s]
+        argv << (expected_members ? expected_members.size : -1)
+        argv.concat(expected_members.to_a.sort) if expected_members
+
+        code = with_connection do |conn|
+          run_replace_script(conn, REPLACE_SCRIPT, key_for(feature.key), argv)
+        end.to_i
+
+        case code
+        when 1, 3
+          true
+        when 0
+          raise ActorSetConflict.new(
+            feature_key: feature.key,
+            expected: expected_members,
+            actual: normalize_member_values(get(feature)[gate.key]),
+          )
+        when 2
+          raise ActorSetConflict.new(
+            "Cannot replace member #{old_thing.value.inspect} with #{new_thing.value.inspect} " \
+              "on feature #{feature.key.inspect} because neither is enabled. " \
+              "Re-read the members and retry if another replacement already ran.",
+            feature_key: feature.key,
+            expected: expected_members,
+            actual: normalize_member_values(get(feature)[gate.key]),
+          )
+        else
+          raise Flipper::Error, "unexpected response #{code.inspect} from actor replacement script"
+        end
+      end
+
       private
+
+      # Private: Replaces one member of a :set gate with another in one
+      # server-side step.
+      #
+      # KEYS[1] - the feature hash key.
+      # ARGV[1] - field prefix ("<gate key>/").
+      # ARGV[2] - value of the member that should leave.
+      # ARGV[3] - value of the member that should join.
+      # ARGV[4] - expected member count, or -1 when no expectation was given.
+      # ARGV[5..] - the expected member values, sorted.
+      #
+      # Returns 1 when the replacement was applied, 3 when it was already the
+      # case, 0 when the expected members do not match the set, and 2 when
+      # neither the old nor the new member is present.
+      REPLACE_SCRIPT = <<~LUA.freeze
+        local key = KEYS[1]
+        local prefix = ARGV[1]
+        local old_field = prefix .. ARGV[2]
+        local new_field = prefix .. ARGV[3]
+        local expected_count = tonumber(ARGV[4])
+
+        if expected_count >= 0 then
+          local current_count = 0
+          for _, field in ipairs(redis.call("HKEYS", key)) do
+            if string.sub(field, 1, string.len(prefix)) == prefix then
+              current_count = current_count + 1
+            end
+          end
+          if current_count ~= expected_count then
+            return 0
+          end
+          for i = 5, 4 + expected_count do
+            if redis.call("HEXISTS", key, prefix .. ARGV[i]) == 0 then
+              return 0
+            end
+          end
+        end
+
+        local has_old = redis.call("HEXISTS", key, old_field)
+        local has_new = redis.call("HEXISTS", key, new_field)
+        if has_old == 0 and has_new == 0 then
+          return 2
+        end
+
+        redis.call("HDEL", key, old_field)
+        redis.call("HSET", key, new_field, 1)
+        return 1
+      LUA
+
+      # Private: Runs the replacement script, tolerating the positional and
+      # keyword call styles of the supported redis-rb versions.
+      def run_replace_script(conn, script, key, argv)
+        unless conn.respond_to?(:eval)
+          raise Flipper::Error, "the configured Redis client does not support EVAL, which is required to replace actors atomically"
+        end
+
+        begin
+          conn.eval(script, keys: [key], argv: argv)
+        rescue ArgumentError
+          # redis-rb < 4.6 took keys and argv positionally.
+          conn.eval(script, [key], argv)
+        end
+      end
 
       # Private: The feature list and sync version live at keys next to the
       # feature data, so a feature with the same key would overwrite or

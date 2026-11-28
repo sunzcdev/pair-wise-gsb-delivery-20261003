@@ -346,6 +346,49 @@ RSpec.shared_examples_for 'a flipper adapter' do
       expect(flipper[:stats]).not_to be_enabled
     end
   end
+
+  describe '#replace' do
+    let(:old_actor) { Flipper::Types::Actor.new(Flipper::Actor.new('old')) }
+    let(:new_actor) { Flipper::Types::Actor.new(Flipper::Actor.new('new')) }
+
+    before do
+      flipper[:stats].enable_actor Flipper::Actor.new('old')
+      flipper[:stats].enable_actor Flipper::Actor.new('kept')
+    end
+
+    it 'swaps one actor for another in a single change' do
+      expect(subject.replace(feature, actor_gate, old_actor, new_actor)).to eq(true)
+
+      expect(feature.actors_value).to eq(Set['new', 'kept'])
+      expect(feature.enabled?(Flipper::Actor.new('old'))).to be(false)
+      expect(feature.enabled?(Flipper::Actor.new('new'))).to be(true)
+      expect(feature.enabled?(Flipper::Actor.new('kept'))).to be(true)
+    end
+
+    it 'raises a retryable conflict and writes nothing when expected is stale' do
+      expect {
+        subject.replace(feature, actor_gate, old_actor, new_actor, expected: %w[old ghost])
+      }.to raise_error(Flipper::ActorSetConflict) { |error| expect(error.retryable?).to be(true) }
+
+      expect(feature.actors_value).to eq(Set['old', 'kept'])
+    end
+
+    it 'applies when the expected members still match' do
+      expect(
+        subject.replace(feature, actor_gate, old_actor, new_actor, expected: %w[old kept]),
+      ).to eq(true)
+
+      expect(feature.actors_value).to eq(Set['new', 'kept'])
+    end
+
+    it 'is idempotent when the old actor already left and the new one is enabled' do
+      flipper[:stats].disable_actor Flipper::Actor.new('old')
+      flipper[:stats].enable_actor Flipper::Actor.new('new')
+
+      expect(subject.replace(feature, actor_gate, old_actor, new_actor)).to eq(true)
+      expect(feature.actors_value).to eq(Set['new', 'kept'])
+    end
+  end
 end
 
 # Opt in for adapters that keep the sync version of the flags synced into

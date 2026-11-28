@@ -54,6 +54,11 @@ module Flipper
         super
       end
 
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        assert_feature_exists(feature) unless self.class.sync_mode
+        super
+      end
+
       private
 
       def assert_feature_exists(feature)

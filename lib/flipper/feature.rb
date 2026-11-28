@@ -243,6 +243,44 @@ module Flipper
       disable Types::Actor.wrap(actor)
     end
 
+    # Public: Replaces one actor with another in a single set change.
+    #
+    # Unlike disabling the old actor and then enabling the new one, the whole
+    # change is decided before anything is written. A set that is already at
+    # its limit can still swap a member, because the set never grows past the
+    # members it has now, and a replacement that fails never loses a member:
+    # when the new actor cannot be enabled, the old actor stays enabled.
+    #
+    # old_actor - a Flipper::Types::Actor instance or an object that responds
+    #             to flipper_id. Should be enabled now.
+    # new_actor - a Flipper::Types::Actor instance or an object that responds
+    #             to flipper_id. Becomes enabled in place of the old actor.
+    # expected  - optional Enumerable of the members the caller observed
+    #             (Strings, Actors or Types::Actor instances). When the actor
+    #             set no longer matches, Flipper::ActorSetConflict is raised
+    #             before anything is written so the caller can re-read and
+    #             retry. Two admins replacing at the same time get one success
+    #             and one ActorSetConflict, never an over-limit set.
+    #
+    # Returns true.
+    # Raises Flipper::ActorSetConflict when the members are stale.
+    def replace_actor(old_actor, new_actor, expected: nil)
+      ensure_not_reserved!
+      instrument(:replace_actor) do |payload|
+        gate = gate(:actor)
+        wrapped_old = gate.wrap(old_actor)
+        wrapped_new = gate.wrap(new_actor)
+
+        adapter.add self
+
+        payload[:gate_name] = gate.name
+        payload[:thing] = [wrapped_old, wrapped_new]
+
+        adapter.replace self, gate, wrapped_old, wrapped_new, expected: expected
+      end
+    end
+    alias_method :swap_actor, :replace_actor
+
     # Public: Disables a feature for a group.
     #
     # group - a Flipper::Types::Group instance or a String or Symbol name of a

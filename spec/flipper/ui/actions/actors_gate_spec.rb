@@ -228,5 +228,65 @@ RSpec.describe Flipper::UI::Actions::ActorsGate do
         end
       end
     end
+
+    context 'replacing an actor' do
+      before do
+        flipper[:search].enable_actor Flipper::Actor.new('User;1')
+      end
+
+      it 'swaps one actor for another in a single change' do
+        post 'features/search/actors',
+             {
+               'from' => 'User;1',
+               'value' => 'User;2',
+               'expected' => 'User;1',
+               'operation' => 'replace',
+               'authenticity_token' => token,
+             },
+             'rack.session' => session
+
+        expect(last_response.status).to be(302)
+        expect(flipper[:search].actors_value).to eq(Set['User;2'])
+        expect(flipper[:search].enabled?(Flipper::Actor.new('User;2'))).to be(true)
+        expect(flipper[:search].enabled?(Flipper::Actor.new('User;1'))).to be(false)
+      end
+
+      it 'redirects back to the form without changing members when the page is stale' do
+        post 'features/search/actors',
+             {
+               'from' => 'User;1',
+               'value' => 'User;2',
+               'expected' => 'User;1, User;9',
+               'operation' => 'replace',
+               'authenticity_token' => token,
+             },
+             'rack.session' => session
+
+        expect(last_response.status).to be(302)
+        location = URI(last_response.headers['location'])
+        expect(location.path).to eq('/features/search/actors')
+        expect(Rack::Utils.parse_query(location.query)['error']).to include('Nothing was changed')
+        expect(flipper[:search].actors_value).to eq(Set['User;1'])
+      end
+
+      it 'replaces at the actor limit because the set does not grow' do
+        limited = Flipper.new(Flipper::Adapters::ActorLimit.new(build_memory_adapter, 1))
+        limited[:search].enable_actor Flipper::Actor.new('User;1')
+
+        post 'features/search/actors',
+             {
+               'from' => 'User;1',
+               'value' => 'User;2',
+               'expected' => 'User;1',
+               'operation' => 'replace',
+               'authenticity_token' => token,
+             },
+             'rack.session' => session,
+             'flipper' => limited
+
+        expect(last_response.status).to be(302)
+        expect(limited[:search].actors_value).to eq(Set['User;2'])
+      end
+    end
   end
 end

@@ -73,6 +73,10 @@ module Flipper
         synced_adapter.disable(feature, gate, thing)
       end
 
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        synced_adapter.replace(feature, gate, old_thing, new_thing, expected: expected)
+      end
+
       private
 
       def synced_adapter

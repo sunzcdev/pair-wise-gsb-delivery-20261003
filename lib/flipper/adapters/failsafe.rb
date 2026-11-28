@@ -1,3 +1,5 @@
+require 'flipper'
+
 module Flipper
   module Adapters
     class Failsafe
@@ -80,6 +82,21 @@ module Flipper
 
       def disable(feature, gate, thing)
         @adapter.disable(feature, gate, thing)
+      rescue *@errors
+        false
+      end
+
+      # Public: Replaces one member of a set gate with another.
+      #
+      # Unlike the writes above, an actor set conflict or an exceeded actor
+      # limit is re-raised rather than turned into false: "another change won,
+      # re-read and retry" and "this change would exceed the limit" are answers
+      # the caller can act on, not the same as "the store is down". Only store
+      # failures are failed safe.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        @adapter.replace(feature, gate, old_thing, new_thing, expected: expected)
+      rescue ActorSetConflict, Adapters::ActorLimit::LimitExceeded
+        raise
       rescue *@errors
         false
       end

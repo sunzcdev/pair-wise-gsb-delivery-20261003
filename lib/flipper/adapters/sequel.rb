@@ -197,6 +197,49 @@ module Flipper
         true
       end
 
+      # Public: Replaces one member of a set gate with another in a single
+      # transaction.
+      #
+      # The members are read and rewritten inside one transaction, so a
+      # concurrent replacement for the same member is serialized behind it. A
+      # caller whose expected members no longer match raises
+      # Flipper::ActorSetConflict without deleting anything. The new row is
+      # inserted before the old one is deleted, so a failed insert leaves the
+      # original member enabled.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        ensure_not_reserved_key!(feature)
+        unsupported_data_type(gate.data_type) unless gate.data_type == :set
+
+        @gate_class.db.transaction do
+          # Lock the gate rows this replacement touches so two replacements for
+          # the same feature serialize here: the second one reads the members
+          # the first committed and either confirms its expected members or
+          # raises a conflict.
+          current = normalize_member_values(
+            @gate_class.where(feature_key: feature.key, key: gate.key.to_s).for_update.select_map(:value),
+          )
+          prospective = plan_member_replacement(
+            current,
+            old_value: old_thing.value,
+            new_value: new_thing.value,
+            expected: expected,
+            feature_key: feature.key,
+          )
+
+          next true if prospective == current
+
+          begin
+            @gate_class.create(gate_attrs(feature, gate, new_thing))
+          rescue ::Sequel::UniqueConstraintViolation
+            # Already present, so the swap still holds once the old row goes.
+          end
+
+          @gate_class.where(feature_key: feature.key, key: gate.key.to_s, value: old_thing.value.to_s).delete
+        end
+
+        true
+      end
+
       private
 
       def unsupported_data_type(data_type)

@@ -45,6 +45,16 @@ module Flipper
         @adapter.read_only?
       end
 
+      # Public: Replaces one member of a set gate with another, delegating to
+      # the wrapped adapter. Defined explicitly (rather than through METHODS)
+      # because it takes a keyword argument that must reach the wrapped
+      # adapter, and so ReadOnly can block it through #wrap.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        wrap(:replace, feature, gate, old_thing, new_thing, expected: expected) do
+          @adapter.replace(feature, gate, old_thing, new_thing, expected: expected)
+        end
+      end
+
       # Override this method to customize the behavior of all delegated methods, and just yield to
       # the block to call the wrapped adapter.
       if RUBY_VERSION >= '3.0'

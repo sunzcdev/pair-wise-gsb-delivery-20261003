@@ -31,6 +31,9 @@ module Flipper
         expression_invalid: Error.new(7, 'The provided expression was not valid.', 422),
         request_invalid: Error.new(8, 'Request invalid.', 400),
         name_reserved: Error.new(9, "Feature names starting with #{Flipper::RESERVED_KEY_PREFIX} are reserved for Flipper.", 422),
+        actor_set_conflict: Error.new(10, 'Another actor change won. Re-read the actors and retry.', 409),
+        actor_limit_exceeded: Error.new(11, 'Actor limit exceeded.', 422),
+        replace_flipper_id_invalid: Error.new(12, 'Required parameter replace_flipper_id is missing.', 422),
       }.freeze
     end
   end

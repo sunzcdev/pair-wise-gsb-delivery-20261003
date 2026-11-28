@@ -157,4 +157,54 @@ RSpec.describe Flipper::Api::V1::Actions::ActorsGate do
       expect(gate['value']).to be_empty
     end
   end
+
+  describe 'replace' do
+    let(:old_actor) { Flipper::Actor.new('old') }
+    let(:new_actor) { Flipper::Actor.new('new') }
+
+    before do
+      flipper[:my_feature].enable_actor(old_actor)
+    end
+
+    it 'swaps the actor in a single change' do
+      put '/features/my_feature/actors',
+          flipper_id: new_actor.flipper_id,
+          replace_flipper_id: old_actor.flipper_id
+
+      expect(last_response.status).to eq(200)
+      expect(flipper[:my_feature].actors_value).to eq(Set['new'])
+      expect(flipper[:my_feature].enabled?(new_actor)).to be(true)
+      expect(flipper[:my_feature].enabled?(old_actor)).to be(false)
+    end
+
+    it 'succeeds at the actor limit because the set does not grow' do
+      limited = Flipper.new(Flipper::Adapters::ActorLimit.new(build_memory_adapter, 1))
+      limited[:my_feature].enable_actor(old_actor)
+
+      put '/features/my_feature/actors',
+          { flipper_id: new_actor.flipper_id, replace_flipper_id: old_actor.flipper_id },
+          'flipper' => limited
+
+      expect(last_response.status).to eq(200)
+      expect(limited[:my_feature].actors_value).to eq(Set['new'])
+    end
+
+    it 'returns 409 and changes nothing when the observed members are stale' do
+      put '/features/my_feature/actors',
+          flipper_id: new_actor.flipper_id,
+          replace_flipper_id: old_actor.flipper_id,
+          expected: %w[old ghost]
+
+      expect(last_response.status).to eq(409)
+      expect(json_response['code']).to eq(10)
+      expect(flipper[:my_feature].actors_value).to eq(Set['old'])
+    end
+
+    it 'requires replace_flipper_id' do
+      put '/features/my_feature/actors', flipper_id: new_actor.flipper_id
+
+      expect(last_response.status).to eq(422)
+      expect(json_response['code']).to eq(12)
+    end
+  end
 end

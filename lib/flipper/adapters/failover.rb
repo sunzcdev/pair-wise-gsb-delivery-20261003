@@ -95,6 +95,17 @@ module Flipper
           @secondary.disable(feature, gate, thing) if @dual_write
         end
       end
+
+      # Public: Replaces one member of a set gate with another.
+      #
+      # Writes go to the primary like the other mutations above; the secondary
+      # only serves reads when the primary is unavailable. The primary decides
+      # the change, and the secondary is mirrored only when dual writing.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        @primary.replace(feature, gate, old_thing, new_thing, expected: expected).tap do
+          @secondary.replace(feature, gate, old_thing, new_thing, expected: nil) if @dual_write
+        end
+      end
     end
   end
 end

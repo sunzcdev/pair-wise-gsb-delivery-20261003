@@ -124,6 +124,13 @@ module Flipper
       end
 
       # Public
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        @adapter.replace(feature, gate, old_thing, new_thing, expected: expected).tap do
+          expire_feature(feature)
+        end
+      end
+
+      # Public
       def read_only?
         @adapter.read_only?
       end

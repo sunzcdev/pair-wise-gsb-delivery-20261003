@@ -343,6 +343,59 @@ module Flipper
           refute @flipper[:stats].enabled?
         end
       end
+
+      def test_can_replace_one_actor_with_another
+        old_actor = Flipper::Types::Actor.new(Flipper::Actor.new('old'))
+        new_actor = Flipper::Types::Actor.new(Flipper::Actor.new('new'))
+
+        @feature.enable_actor Flipper::Actor.new('old')
+        @feature.enable_actor Flipper::Actor.new('kept')
+
+        assert_equal true, @adapter.replace(@feature, @actor_gate, old_actor, new_actor)
+
+        assert_equal Set['new', 'kept'], @feature.actors_value
+        refute @feature.enabled?(Flipper::Actor.new('old'))
+        assert @feature.enabled?(Flipper::Actor.new('new'))
+        assert @feature.enabled?(Flipper::Actor.new('kept'))
+      end
+
+      def test_replace_raises_retryable_conflict_and_writes_nothing_when_expected_is_stale
+        old_actor = Flipper::Types::Actor.new(Flipper::Actor.new('old'))
+        new_actor = Flipper::Types::Actor.new(Flipper::Actor.new('new'))
+
+        @feature.enable_actor Flipper::Actor.new('old')
+        @feature.enable_actor Flipper::Actor.new('kept')
+
+        error = assert_raises Flipper::ActorSetConflict do
+          @adapter.replace(@feature, @actor_gate, old_actor, new_actor, expected: %w[old ghost])
+        end
+        assert error.retryable?
+        assert_equal Set['old', 'kept'], @feature.actors_value
+      end
+
+      def test_replace_applies_when_expected_members_match
+        old_actor = Flipper::Types::Actor.new(Flipper::Actor.new('old'))
+        new_actor = Flipper::Types::Actor.new(Flipper::Actor.new('new'))
+
+        @feature.enable_actor Flipper::Actor.new('old')
+        @feature.enable_actor Flipper::Actor.new('kept')
+
+        assert_equal true, @adapter.replace(@feature, @actor_gate, old_actor, new_actor, expected: %w[old kept])
+        assert_equal Set['new', 'kept'], @feature.actors_value
+      end
+
+      def test_replace_is_idempotent_when_old_left_and_new_is_enabled
+        old_actor = Flipper::Types::Actor.new(Flipper::Actor.new('old'))
+        new_actor = Flipper::Types::Actor.new(Flipper::Actor.new('new'))
+
+        @feature.enable_actor Flipper::Actor.new('old')
+        @feature.enable_actor Flipper::Actor.new('kept')
+        @feature.disable_actor Flipper::Actor.new('old')
+        @feature.enable_actor Flipper::Actor.new('new')
+
+        assert_equal true, @adapter.replace(@feature, @actor_gate, old_actor, new_actor)
+        assert_equal Set['new', 'kept'], @feature.actors_value
+      end
     end
   end
 end

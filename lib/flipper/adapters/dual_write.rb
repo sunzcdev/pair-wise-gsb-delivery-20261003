@@ -70,6 +70,22 @@ module Flipper
           @local.disable(feature, gate, thing)
         end
       end
+
+      # Public: Replaces one member of a set gate with another.
+      #
+      # The remote decides the change (including capacity/conflict errors) as
+      # it does for the other writes, then the local copy is mirrored without
+      # the caller's expectation: a local copy that lagged behind must not turn
+      # a successful remote change into a failure.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        @remote.replace(feature, gate, old_thing, new_thing, expected: expected).tap do
+          begin
+            @local.replace(feature, gate, old_thing, new_thing, expected: nil)
+          rescue ActorSetConflict
+            # Next sync reconciles the local copy.
+          end
+        end
+      end
     end
   end
 end

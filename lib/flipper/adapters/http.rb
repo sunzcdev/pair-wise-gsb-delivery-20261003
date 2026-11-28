@@ -167,6 +167,46 @@ module Flipper
         true
       end
 
+      # Public: Replaces one actor with another through the API's single set
+      # change endpoint.
+      #
+      # The API applies both halves as one change and can succeed while the
+      # actor set is at its limit. A 409 means another change won: it becomes
+      # Flipper::ActorSetConflict so callers can re-read and retry, the same as
+      # with local adapters.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        return super unless gate.key == :actors
+
+        payload = {
+          flipper_id: new_thing.value.to_s,
+          replace_flipper_id: old_thing.value.to_s,
+        }
+        if expected
+          payload[:expected] = normalize_expected_members(expected).to_a
+        end
+
+        response = @client.put("/features/#{path_escape(feature.key)}/actors", JSON.generate(payload))
+
+        if response.is_a?(Net::HTTPConflict)
+          raise Flipper::ActorSetConflict.new(
+            feature_key: feature.key,
+            expected: normalize_expected_members(expected),
+            actual: normalize_member_values(get(feature)[gate.key]),
+          )
+        end
+
+        unless response.is_a?(Net::HTTPOK)
+          if actor_limit_response?(response)
+            raise Flipper::Adapters::ActorLimit::LimitExceeded,
+                  "Actor limit exceeded for feature #{feature.key}. See https://www.flippercloud.io/docs/features/actors#limitations"
+          end
+
+          raise Error, response
+        end
+
+        true
+      end
+
       def import(source)
         adapter = self.class.from(source)
         export = adapter.export(format: :json, version: 1)
@@ -246,6 +286,17 @@ module Flipper
       end
 
       private
+
+      # Private: An API 422 body is a limit error (as opposed to a malformed
+      # request) when it carries the actor_limit_exceeded code (11).
+      def actor_limit_response?(response)
+        return false unless response.code.to_i == 422
+
+        parsed = Typecast.from_json(response.body.to_s)
+        parsed.is_a?(Hash) && parsed['code'] == 11
+      rescue StandardError
+        false
+      end
 
       def unsupported_data_type(data_type)
         raise "#{data_type} is not supported by this adapter"

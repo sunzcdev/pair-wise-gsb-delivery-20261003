@@ -136,6 +136,58 @@ module Flipper
         true
       end
 
+      # Public: Replaces one member of a set gate with another in a single
+      # document update.
+      #
+      # The update both pulls the old member and adds the new one, so the
+      # document is never observed without the old member and before the new
+      # one exists, and the set cannot grow when the change is a swap. The
+      # filter includes the caller's expected members, so a client working from
+      # a stale list matches no document and gets
+      # Flipper::ActorSetConflict instead of overwriting the winner.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        ensure_not_reserved_key!(feature)
+        unsupported_data_type(gate.data_type) unless gate.data_type == :set
+
+        current = normalize_member_values(get(feature)[gate.key])
+        prospective = plan_member_replacement(
+          current,
+          old_value: old_thing.value,
+          new_value: new_thing.value,
+          expected: expected,
+          feature_key: feature.key,
+        )
+
+        return true if prospective == current
+
+        expected_members = normalize_expected_members(expected)
+        filter = {_id: feature.key.to_s}
+        if expected_members
+          # Exact member match: every expected member is present and the set
+          # has no extras, so a list another admin already changed does not
+          # match.
+          filter[gate.key.to_s] = {'$all' => expected_members.to_a, '$size' => expected_members.size}
+        end
+
+        result = @collection.find(filter).update_one(
+          {
+            '$pull' => {gate.key.to_s => old_thing.value.to_s},
+            '$addToSet' => {gate.key.to_s => new_thing.value.to_s},
+          },
+          upsert: false,
+        )
+
+        if result.modified_count.zero? && expected_members
+          raise ActorSetConflict.new(
+            feature_key: feature.key,
+            expected: expected_members,
+            actual: normalize_member_values(get(feature)[gate.key]),
+          )
+        end
+
+        true
+      end
+
       private
 
       # Private: The feature list and sync version live in documents next to

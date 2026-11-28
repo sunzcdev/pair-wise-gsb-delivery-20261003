@@ -133,6 +133,33 @@ module Flipper
         true
       end
 
+      # Public: Replaces one member of a set-type gate with another inside a
+      # single store transaction, so the swap is all-or-nothing on disk.
+      #
+      # The plan is checked against the members read inside the transaction, so
+      # a writer that committed first is visible and a caller working from a
+      # stale member list raises Flipper::ActorSetConflict instead of
+      # overwriting the winner. Because the pair is written together, a reader
+      # never sees the set without the old member and before the new exists.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        @store.transaction do
+          current = normalize_member_values(set_members(key(feature, gate)))
+          prospective = plan_member_replacement(
+            current,
+            old_value: old_thing.value,
+            new_value: new_thing.value,
+            expected: expected,
+            feature_key: feature.key,
+          )
+
+          next true if prospective == current
+
+          set_add key(feature, gate), new_thing.value.to_s
+          set_delete key(feature, gate), old_thing.value.to_s
+          true
+        end
+      end
+
       # Public
       def inspect
         attributes = [

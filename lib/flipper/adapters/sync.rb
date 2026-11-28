@@ -89,6 +89,22 @@ module Flipper
         end
       end
 
+      # Public: Replaces one member of a set gate with another.
+      #
+      # The remote is the source of truth and decides the change. The local
+      # copy is mirrored without the caller's expectation so a local cache that
+      # lagged behind cannot turn a successful remote change into a failure;
+      # the interval synchronizer reconciles any remaining drift.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        @remote.replace(feature, gate, old_thing, new_thing, expected: expected).tap do
+          begin
+            @local.replace(feature, gate, old_thing, new_thing, expected: nil)
+          rescue ActorSetConflict
+            # Next sync reconciles the local copy.
+          end
+        end
+      end
+
       private
 
       def synchronize

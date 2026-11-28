@@ -68,7 +68,7 @@ module Flipper
                  :enabled?, :enable, :disable,
                  :enable_expression, :disable_expression,
                  :expression, :add_expression, :remove_expression,
-                 :enable_actor, :disable_actor,
+                 :enable_actor, :disable_actor, :replace_actor, :swap_actor,
                  :enable_group, :disable_group,
                  :enable_percentage_of_actors, :disable_percentage_of_actors,
                  :enable_percentage_of_time, :disable_percentage_of_time,

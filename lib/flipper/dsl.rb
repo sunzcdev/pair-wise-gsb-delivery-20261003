@@ -152,6 +152,23 @@ module Flipper
       feature(name).disable_actor(actor)
     end
 
+    # Public: Replace one actor with another in a single set change.
+    #
+    # name - The String or Symbol name of the feature.
+    # old_actor - a Flipper::Types::Actor instance or an object that responds
+    #             to flipper_id. Should be enabled now.
+    # new_actor - a Flipper::Types::Actor instance or an object that responds
+    #             to flipper_id. Becomes enabled in place of the old actor.
+    # expected  - optional Enumerable of the members the caller observed. A
+    #             mismatch raises Flipper::ActorSetConflict before anything is
+    #             written so the caller can re-read and retry.
+    #
+    # Returns result of Feature#replace_actor.
+    def replace_actor(name, old_actor, new_actor, expected: nil)
+      feature(name).replace_actor(old_actor, new_actor, expected: expected)
+    end
+    alias_method :swap_actor, :replace_actor
+
     # Public: Disable a feature for a group.
     #
     # name - The String or Symbol name of the feature.

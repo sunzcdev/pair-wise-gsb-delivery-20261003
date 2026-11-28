@@ -117,6 +117,36 @@ module Flipper
         end
       end
 
+      # Public: Replaces one member of a set-type gate with another as a single
+      # change while holding the adapter lock.
+      #
+      # Both halves happen under the mutex, so a reader can never observe the
+      # old member removed and the new member not yet added, and the set never
+      # grows past the members it already has. The plan is checked against the
+      # members under the same lock, so two replacements cannot interleave: the
+      # one that writes second sees the first write and either confirms its
+      # expectation or raises Flipper::ActorSetConflict.
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        synchronize do
+          current = normalize_member_values(@source.dig(feature.key, gate.key))
+          prospective = plan_member_replacement(
+            current,
+            old_value: old_thing.value,
+            new_value: new_thing.value,
+            expected: expected,
+            feature_key: feature.key,
+          )
+
+          next true if prospective == current
+
+          @source[feature.key] ||= default_config
+          values = (@source[feature.key][gate.key] ||= Set.new)
+          values.add(new_thing.value.to_s)
+          values.delete(old_thing.value.to_s)
+          true
+        end
+      end
+
       # Public
       def inspect
         attributes = [

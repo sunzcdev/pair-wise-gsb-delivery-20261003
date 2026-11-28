@@ -40,6 +40,84 @@ RSpec.describe Flipper::Adapters::ActorLimit do
         end
       end
     end
+
+    describe '#replace' do
+      let(:limit) { 2 }
+
+      before do
+        feature.enable_actor Flipper::Actor.new('old')
+        feature.enable_actor Flipper::Actor.new('kept')
+      end
+
+      it 'swaps a member of a full set and keeps the total bounded' do
+        expect(feature.replace_actor(Flipper::Actor.new('old'), Flipper::Actor.new('new'))).to be(true)
+
+        expect(feature.actors_value).to eq(Set['new', 'kept'])
+        expect(feature.actors_value.size).to eq(limit)
+        expect(feature.enabled?(Flipper::Actor.new('new'))).to be(true)
+        expect(feature.enabled?(Flipper::Actor.new('old'))).to be(false)
+        expect(feature.enabled?(Flipper::Actor.new('kept'))).to be(true)
+      end
+
+      it 'refuses a change that is not a swap instead of growing the set' do
+        expect {
+          feature.replace_actor(Flipper::Actor.new('ghost'), Flipper::Actor.new('other'))
+        }.to raise_error(Flipper::ActorSetConflict)
+
+        expect(feature.actors_value).to eq(Set['old', 'kept'])
+      end
+
+      it 'raises a retryable conflict and writes nothing when expected is stale' do
+        expect {
+          feature.replace_actor(
+            Flipper::Actor.new('old'),
+            Flipper::Actor.new('new'),
+            expected: %w[old ghost],
+          )
+        }.to raise_error(Flipper::ActorSetConflict) { |error| expect(error.retryable?).to be(true) }
+
+        expect(feature.actors_value).to eq(Set['old', 'kept'])
+      end
+
+      it 'settles two racing replacements at zero slots with one winner and one retry' do
+        full = Flipper::Adapters::ActorLimit.new(Flipper::Adapters::Memory.new, 1)
+        contest = Flipper.new(full)
+        contest.enable_actor :pilot, Flipper::Actor.new('old')
+        observed = contest[:pilot].actors_value.to_a
+
+        gate = Queue.new
+        results = Queue.new
+        threads = 2.times.map do |index|
+          Thread.new do
+            gate.pop
+            begin
+              actor = Flipper::Actor.new("new#{index}")
+              contest.replace_actor(:pilot, Flipper::Actor.new('old'), actor, expected: observed)
+              results << [actor, :ok]
+            rescue Flipper::ActorSetConflict
+              results << [Flipper::Actor.new("new#{index}"), :retry]
+            end
+          end
+        end
+        2.times { gate << true }
+        threads.each(&:join)
+
+        outcomes = []
+        outcomes << results.pop until results.empty?
+        winner = outcomes.detect { |_actor, status| status == :ok }
+        loser = outcomes.detect { |_actor, status| status == :retry }
+
+        expect(winner).not_to be_nil
+        expect(loser).not_to be_nil
+        expect(outcomes.size).to eq(2)
+
+        # The real gate results say who won and who needs to retry.
+        expect(contest[:pilot].actors_value).to eq(Set[winner.first.flipper_id])
+        expect(contest.enabled?(:pilot, winner.first)).to be(true)
+        expect(contest.enabled?(:pilot, loser.first)).to be(false)
+        expect(contest.enabled?(:pilot, Flipper::Actor.new('old'))).to be(false)
+      end
+    end
   end
 
   describe '.sync_mode' do

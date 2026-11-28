@@ -147,12 +147,26 @@ module Flipper
         end
       end
 
+      # Public
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        default_payload = {
+          operation: :replace,
+          adapter_name: @adapter.name,
+          feature_name: feature.name,
+          gate_name: gate.name,
+          thing_value: [old_thing.value, new_thing.value],
+        }
+
+        @instrumenter.instrument(InstrumentationName, default_payload) do |payload|
+          payload[:result] = @adapter.replace(feature, gate, old_thing, new_thing, expected: expected)
+        end
+      end
+
       def sync_version
         default_payload = {
           operation: :sync_version,
           adapter_name: @adapter.name,
         }
-
         @instrumenter.instrument(InstrumentationName, default_payload) do |payload|
           payload[:result] = @adapter.sync_version
         end

@@ -22,3 +22,30 @@
     </form>
   </div>
 </div>
+
+<div class="card">
+  <h4 class="card-header">
+    <a class="link-dark" href="<%= script_name %>/features/<%= Flipper::UI::Util.escape @feature.key %>"><%= @feature.key %></a>
+    /
+    Replace Actor
+  </h4>
+  <div class="card-body">
+    <p>
+      Replace one enabled actor with another as a single change, so the total
+      number of actors is never exceeded. The actor being removed must already
+      be enabled; if the new actor cannot be added, the original stays enabled.
+    </p>
+    <form action="<%= script_name %>/features/<%= Flipper::UI::Util.escape @feature.key %>/actors" method="post" class="row">
+      <%== csrf_input_tag %>
+      <input type="hidden" name="operation" value="replace">
+      <input type="hidden" name="expected" value="<%= Flipper::UI::Util.escape @feature.actors_value.to_a.join(Flipper::UI.configuration.actors_separator) %>">
+      <div class="col">
+        <input type="text" name="from" placeholder="actor to remove" class="form-control">
+      </div>
+      <div class="col">
+        <input type="text" name="value" placeholder="actor to add" class="form-control">
+      </div>
+      <div class="col-auto"><input type="submit" value="Replace Actor" class="btn btn-primary"></div>
+    </form>
+  </div>
+</div>

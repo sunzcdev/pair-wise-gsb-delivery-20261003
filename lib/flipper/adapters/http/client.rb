@@ -68,6 +68,10 @@ module Flipper
           perform Net::HTTP::Post, path, @headers, body: body
         end
 
+        def put(path, body = nil)
+          perform Net::HTTP::Put, path, @headers, body: body
+        end
+
         def delete(path, body = nil)
           perform Net::HTTP::Delete, path, @headers, body: body
         end

@@ -129,6 +129,13 @@ module Flipper
         result
       end
 
+      # Public
+      def replace(feature, gate, old_thing, new_thing, expected: nil)
+        result = @adapter.replace(feature, gate, old_thing, new_thing, expected: expected)
+        expire_feature_cache(feature.key)
+        result
+      end
+
       # Public: Generate the cache key for a given feature.
       #
       # key - The String or Symbol feature key.
