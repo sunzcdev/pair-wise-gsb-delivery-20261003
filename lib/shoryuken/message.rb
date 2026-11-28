@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'monitor'
+
 module Shoryuken
   # Represents an SQS message received by a Shoryuken worker. This class wraps the raw AWS SQS message data and provides
   # convenient methods for interacting with the message, including deletion and visibility timeout management.
@@ -98,6 +100,9 @@ module Shoryuken
       self.data       = data
       self.queue_url  = queue.url
       self.queue_name = queue.name
+
+      @visibility_monitor = Monitor.new
+      @visibility_settled = false
     end
 
     # Tells whether this is the last receive before SQS moves the message to the dead-letter queue.
@@ -128,17 +133,29 @@ module Shoryuken
     # Once deleted, the message will not be redelivered and cannot be retrieved again.
     # This is typically called after successful message processing when auto_delete is disabled.
     #
+    # A visibility renewal already in flight for this message (see {#renew_visibility}) is awaited before the delete is
+    # sent, and no later renewal is sent: the delete is the last change this message's receipt handle gets. This keeps a
+    # stalled renewal from landing after the delete and making the message visible again.
+    #
     # @return [Aws::SQS::Types::DeleteMessageResult] The deletion result
     # @raise [Aws::SQS::Errors::ServiceError] If the deletion fails
     def delete
-      client.delete_message(
-        queue_url: queue_url,
-        receipt_handle: data.receipt_handle
-      )
+      visibility_monitor.synchronize do
+        @visibility_settled = true
+
+        client.delete_message(
+          queue_url: queue_url,
+          receipt_handle: data.receipt_handle
+        )
+      end
     end
 
     # Changes the visibility timeout of this message with additional options.
     # This allows you to hide the message from other consumers for a longer or shorter period.
+    #
+    # A change runs after any renewal of this message already in flight. A release (`visibility_timeout: 0`) is terminal:
+    # no later renewal is sent for this receipt handle, so the release is not undone by a stalled renewal that lands
+    # afterwards. A positive change can still be followed by renewals.
     #
     # @param options [Hash] Options to pass to change_message_visibility
     # @option options [Integer] :visibility_timeout New visibility timeout in seconds
@@ -150,9 +167,46 @@ module Shoryuken
     #
     # @see #visibility_timeout= For a simpler interface
     def change_visibility(options)
-      client.change_message_visibility(
-        options.merge(queue_url: queue_url, receipt_handle: data.receipt_handle)
-      )
+      visibility_monitor.synchronize do
+        @visibility_settled = true if release?(options)
+
+        client.change_message_visibility(
+          options.merge(queue_url: queue_url, receipt_handle: data.receipt_handle)
+        )
+      end
+    end
+
+    # Renews the visibility timeout of this message while it is still being processed. Unlike {#change_visibility} this
+    # is the background auto-extender's call: it is skipped once the message's visibility is settled (deleted or
+    # released), so a renewal can never follow the terminal change. A renewal that is already in flight is not
+    # interrupted - the terminal change waits for it instead - so the final visibility on SQS is always the terminal one.
+    #
+    # @param timeout [Integer] the visibility timeout in seconds
+    # @return [Aws::SQS::Types::ChangeMessageVisibilityResult, nil] the renewal result, or nil when the message's
+    #   visibility is already settled
+    # @raise [Aws::SQS::Errors::ServiceError] If the renewal fails
+    #
+    # @see #settle_visibility
+    def renew_visibility(timeout)
+      visibility_monitor.synchronize do
+        if @visibility_settled
+          nil
+        else
+          change_visibility(visibility_timeout: timeout)
+        end
+      end
+    end
+
+    # Marks this message's visibility as settled and waits for a renewal already in flight to finish. After this no
+    # renewal is sent for the receipt handle, so the terminal change (delete or release) that follows cannot be undone by
+    # a stalled renewal. A message still being renewed normally is not affected: only this message is settled.
+    #
+    # @return [void]
+    #
+    # @see #renew_visibility
+    def settle_visibility
+      visibility_monitor.synchronize { @visibility_settled = true }
+      nil
     end
 
     # Sets the visibility timeout for this message.
@@ -174,14 +228,35 @@ module Shoryuken
     # @example Making message immediately visible again
     #   sqs_msg.visibility_timeout = 0  # Make visible immediately
     def visibility_timeout=(timeout)
-      client.change_message_visibility(
-        queue_url: queue_url,
-        receipt_handle: data.receipt_handle,
-        visibility_timeout: timeout
-      )
+      visibility_monitor.synchronize do
+        @visibility_settled = true if !timeout.nil? && timeout.to_i.zero?
+
+        client.change_message_visibility(
+          queue_url: queue_url,
+          receipt_handle: data.receipt_handle,
+          visibility_timeout: timeout
+        )
+      end
     end
 
     private
+
+    # The monitor serializing the visibility changes of this message
+    #
+    # @return [Monitor] the monitor guarding {#renew_visibility} and the terminal changes
+    def visibility_monitor
+      @visibility_monitor ||= Monitor.new
+    end
+
+    # Tells whether a visibility change makes the message visible again, i.e. is the terminal release of its receipt
+    # handle
+    #
+    # @param options [Hash] the options given to {#change_visibility}
+    # @return [Boolean] true when the change sets the visibility timeout to 0
+    def release?(options)
+      timeout = options[:visibility_timeout] || options['visibility_timeout']
+      !timeout.nil? && timeout.to_i.zero?
+    end
 
     # Returns how many times SQS has delivered this message, this delivery included.
     #

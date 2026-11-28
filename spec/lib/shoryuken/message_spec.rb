@@ -113,6 +113,145 @@ RSpec.describe Shoryuken::Message do
     end
   end
 
+  # The visibility of a message is either renewed while its job runs or settled for good when the job's terminal
+  # handling deletes or releases it. These pin the ordering that keeps a stalled renewal from undoing that terminal
+  # change: a renewal in flight finishes first, and no renewal is sent after the message is settled.
+  describe 'visibility renewal and terminal changes' do
+    describe '#renew_visibility' do
+      it 'changes the visibility timeout of the message' do
+        expect(client).to receive(:change_message_visibility).with(
+          hash_including(
+            queue_url: 'https://sqs.us-east-1.amazonaws.com/123456789/test-queue',
+            receipt_handle: 'handle-456',
+            visibility_timeout: 30
+          )
+        )
+
+        subject.renew_visibility(30)
+      end
+
+      it 'is skipped once the message is settled' do
+        subject.settle_visibility
+
+        expect(client).not_to receive(:change_message_visibility)
+
+        expect(subject.renew_visibility(30)).to be_nil
+      end
+
+      it 'is skipped once the message is released' do
+        allow(client).to receive(:change_message_visibility)
+
+        subject.visibility_timeout = 0
+
+        expect(client).to have_received(:change_message_visibility).once
+        expect(subject.renew_visibility(30)).to be_nil
+        expect(client).to have_received(:change_message_visibility).once
+      end
+
+      it 'is still sent after a positive visibility change' do
+        allow(client).to receive(:change_message_visibility)
+
+        subject.change_visibility(visibility_timeout: 120)
+        subject.renew_visibility(30)
+
+        expect(client).to have_received(:change_message_visibility).twice
+      end
+
+      it 'is skipped once the message is deleted' do
+        allow(client).to receive(:change_message_visibility)
+        allow(client).to receive(:delete_message)
+
+        subject.delete
+
+        expect(subject.renew_visibility(30)).to be_nil
+        expect(client).not_to have_received(:change_message_visibility)
+      end
+    end
+
+    describe '#settle_visibility' do
+      it 'waits for a renewal already in flight, so the terminal change follows it' do
+        renewal_started = Queue.new
+        finish_renewal = Queue.new
+        order = []
+
+        allow(client).to receive(:change_message_visibility) do
+          renewal_started << true
+          finish_renewal.pop
+          order << :renewal
+        end
+
+        renewal = Thread.new { subject.renew_visibility(30) }
+        renewal_started.pop
+
+        settle = Thread.new do
+          subject.settle_visibility
+          order << :settled
+        end
+
+        # The settle must block until the renewal in flight returns
+        sleep 0.05
+        expect(order).to be_empty
+
+        finish_renewal << true
+        renewal.join
+        settle.join
+
+        expect(order).to eq(%i[renewal settled])
+      end
+
+      it 'lets other messages keep renewing' do
+        other = described_class.new(client, queue, data)
+
+        allow(client).to receive(:change_message_visibility)
+
+        subject.settle_visibility
+        other.renew_visibility(30)
+        other.renew_visibility(30)
+
+        expect(client).to have_received(:change_message_visibility).twice
+      end
+    end
+
+    describe '#delete' do
+      it 'is skipped for renewal once it ran' do
+        allow(client).to receive(:change_message_visibility)
+        allow(client).to receive(:delete_message)
+
+        subject.delete
+
+        expect(subject.renew_visibility(30)).to be_nil
+        expect(client).not_to have_received(:change_message_visibility)
+      end
+
+      it 'waits for a renewal in flight before deleting' do
+        renewal_started = Queue.new
+        finish_renewal = Queue.new
+        order = []
+
+        allow(client).to receive(:change_message_visibility) do
+          renewal_started << true
+          finish_renewal.pop
+          order << :renewal
+        end
+        allow(client).to receive(:delete_message) { order << :delete }
+
+        renewal = Thread.new { subject.renew_visibility(30) }
+        renewal_started.pop
+
+        delete = Thread.new { subject.delete }
+
+        sleep 0.05
+        expect(order).to be_empty
+
+        finish_renewal << true
+        renewal.join
+        delete.join
+
+        expect(order).to eq(%i[renewal delete])
+      end
+    end
+  end
+
   describe '#last_receive?' do
     let(:attributes) { { 'ApproximateReceiveCount' => receive_count } }
     let(:data) { instance_double('Aws::SQS::Types::Message', attributes: attributes) }

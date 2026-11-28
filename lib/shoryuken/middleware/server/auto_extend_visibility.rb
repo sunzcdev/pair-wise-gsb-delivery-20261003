@@ -17,6 +17,12 @@ module Shoryuken
 
         # Processes a message with automatic visibility timeout extension
         #
+        # The renewal timer is stopped and the message's visibility is settled before this returns, so the terminal
+        # handling of the message (its delete or release) cannot be undone by a renewal that was still in flight when the
+        # job finished. Settling first - and only then killing the timer - lets an issued renewal finish instead of
+        # aborting it mid-request, so the last visibility change SQS records is the terminal one. Other messages keep
+        # renewing: only the finished message is settled.
+        #
         # @param worker [Object] the worker instance
         # @param queue [String] the queue name
         # @param sqs_msg [Shoryuken::Message, Array<Shoryuken::Message>] the message or batch
@@ -34,10 +40,20 @@ module Shoryuken
           timer = auto_visibility_timer(worker, queue, sqs_msg, body)
           yield
         ensure
+          settle_visibility(sqs_msg) if timer
           timer&.kill
         end
 
         private
+
+        # Waits for a renewal of the finished message already in flight and stops any later one, so a terminal delete or
+        # release that follows is the last visibility change of its receipt handle
+        #
+        # @param sqs_msg [Shoryuken::Message] the message whose job finished
+        # @return [void]
+        def settle_visibility(sqs_msg)
+          sqs_msg.settle_visibility if sqs_msg.respond_to?(:settle_visibility)
+        end
 
         # Helper class for extending message visibility
         class MessageVisibilityExtender
@@ -67,7 +83,7 @@ module Shoryuken
                 "Extending message #{queue}/#{sqs_msg.message_id} visibility timeout by #{visibility_timeout}s"
               end
 
-              sqs_msg.change_visibility(visibility_timeout: visibility_timeout)
+              renew_visibility(sqs_msg, visibility_timeout)
             rescue => e
               logger.error do
                 "Could not auto extend the message #{queue}/#{sqs_msg.message_id} visibility timeout. Error: #{e.message}"
@@ -76,6 +92,21 @@ module Shoryuken
           end
 
           private
+
+          # Renews the message's visibility through the message's own coordination point, so a renewal is not sent once
+          # the message's visibility is settled (its delete or release already decided the final visibility). A
+          # message-like object without the coordination point falls back to a plain visibility change.
+          #
+          # @param sqs_msg [Shoryuken::Message] the message to renew
+          # @param visibility_timeout [Integer] the visibility timeout in seconds
+          # @return [void]
+          def renew_visibility(sqs_msg, visibility_timeout)
+            if sqs_msg.respond_to?(:renew_visibility)
+              sqs_msg.renew_visibility(visibility_timeout)
+            else
+              sqs_msg.change_visibility(visibility_timeout: visibility_timeout)
+            end
+          end
 
           # Returns the visibility timeout that applies to a message of the queue: the receive-time visibility_timeout
           # when it is set, else the queue's VisibilityTimeout attribute

@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'timeout'
+
 # We need to run our worker inside actor context.
 class Runner
   def run_and_sleep(worker, queue, sqs_msg, interval)
@@ -22,7 +24,8 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
   let(:sqs_queue) { instance_double Shoryuken::Queue, visibility_timeout: visibility_timeout }
 
   def build_message
-    double Shoryuken::Message, queue_url: queue, body: 'test', receipt_handle: SecureRandom.uuid
+    double Shoryuken::Message, queue_url: queue, body: 'test', receipt_handle: SecureRandom.uuid,
+                               settle_visibility: nil, renew_visibility: nil
   end
 
   let(:sqs_msg) { build_message }
@@ -42,7 +45,18 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
     TestWorker.get_shoryuken_options['auto_visibility_timeout'] = true
 
     allow(sqs_msg).to receive(:queue) { sqs_queue }
-    expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: visibility_timeout)
+    expect(sqs_msg).to receive(:renew_visibility).with(visibility_timeout)
+
+    Runner.new.run_and_sleep(TestWorker.new, queue, sqs_msg, visibility_timeout)
+  end
+
+  it 'settles the finished message so its terminal change is the last visibility change' do
+    TestWorker.get_shoryuken_options['auto_visibility_timeout'] = true
+
+    allow(sqs_msg).to receive(:queue) { sqs_queue }
+    allow(sqs_msg).to receive(:renew_visibility)
+
+    expect(sqs_msg).to receive(:settle_visibility).once
 
     Runner.new.run_and_sleep(TestWorker.new, queue, sqs_msg, visibility_timeout)
   end
@@ -51,7 +65,7 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
     TestWorker.get_shoryuken_options['auto_visibility_timeout'] = true
 
     allow(sqs_msg).to receive(:queue) { sqs_queue }
-    expect(sqs_msg).to_not receive(:change_visibility)
+    expect(sqs_msg).to_not receive(:renew_visibility)
 
     expect { Runner.new.run_and_raise(TestWorker.new, queue, sqs_msg) }.to raise_error(RuntimeError)
   end
@@ -60,9 +74,85 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
     TestWorker.get_shoryuken_options['auto_visibility_timeout'] = false
 
     allow(sqs_msg).to receive(:queue) { sqs_queue }
-    expect(sqs_msg).to_not receive(:change_visibility)
+    expect(sqs_msg).to_not receive(:renew_visibility)
+    expect(sqs_msg).to_not receive(:settle_visibility)
 
     Runner.new.run_and_sleep(TestWorker.new, queue, sqs_msg, visibility_timeout)
+  end
+
+  # The scenario the coordination exists for: a renewal request is stalled inside the SDK (its change_message_visibility
+  # does not return), the job then decides to put the message back at once (visibility 0), and only then is the renewal
+  # released. The put-back must be the last visibility the SQS stub records for that receipt handle.
+  context 'when a renewal is stalled and the job puts the message back' do
+    let(:recorded) { [] }
+    let(:renewal_entered) { Queue.new }
+    let(:release_renewal) { Queue.new }
+
+    # Stands in for the SQS stub: records every visibility change per receipt handle. A renewal stalls until the spec
+    # releases it, so a put-back sent while it is stalled would be recorded before it.
+    let(:stub_client) do
+      recorded_visibilities = recorded
+      entered = renewal_entered
+      release = release_renewal
+
+      client = Object.new
+      client.define_singleton_method(:change_message_visibility) do |params|
+        if params[:visibility_timeout].to_i.positive?
+          entered << true
+          release.pop
+        end
+        recorded_visibilities << [params[:receipt_handle], params[:visibility_timeout]]
+        nil
+      end
+      client
+    end
+
+    let(:queue_url) { 'https://sqs.us-east-1.amazonaws.com/123456789/coord' }
+    let(:data) do
+      Aws::SQS::Types::Message.new(
+        message_id: 'msg-coord', receipt_handle: 'receipt-coord', body: 'job body', attributes: {}
+      )
+    end
+
+    before do
+      allow(Shoryuken::Client).to receive(:queues).with(queue_url).and_return(sqs_queue)
+      allow(sqs_queue).to receive(:url).and_return(queue_url)
+      allow(sqs_queue).to receive(:name).and_return(queue)
+      allow(sqs_queue).to receive(:visibility_timeout).and_return(visibility_timeout)
+      stub_const('Shoryuken::Middleware::Server::AutoExtendVisibility::EXTEND_UPFRONT_SECONDS', extend_upfront)
+    end
+
+    it 'records the put-back after the stalled renewal' do
+      TestWorker.get_shoryuken_options['auto_visibility_timeout'] = true
+
+      message = Shoryuken::Message.new(stub_client, sqs_queue, data)
+      job_done = Queue.new
+
+      result = Thread.new do
+        Shoryuken::Middleware::Server::AutoExtendVisibility.new.call(
+          TestWorker.new, queue, message, message.body
+        ) { job_done.pop }
+      end
+
+      # Let the timer fire and stall inside change_message_visibility
+      Timeout.timeout(10) { renewal_entered.pop }
+
+      # The job finishes and immediately puts the message back. This must block behind the stalled renewal.
+      job_done << true
+      put_back = Thread.new { message.visibility_timeout = 0 }
+      sleep 0.1
+      expect(recorded).to be_empty
+
+      release_renewal << true
+      Timeout.timeout(10) { result.join }
+      Timeout.timeout(10) { put_back.join }
+
+      receipt_visibilities = recorded.select { |receipt, _| receipt == 'receipt-coord' }.map(&:last)
+      expect(receipt_visibilities.last).to eq(0),
+                                           'the put-back must be the last visibility recorded, got ' \
+                                           "#{receipt_visibilities.inspect}"
+      expect(receipt_visibilities).to include(visibility_timeout)
+    end
   end
 
   context 'when batch worker with auto_visibility_timeout' do
@@ -135,7 +225,7 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
     it 'extends by the visibility_timeout set for the queue, before it expires' do
       Shoryuken.sqs_client_receive_message_opts[queue] = { visibility_timeout: receive_visibility_timeout }
 
-      expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: receive_visibility_timeout)
+      expect(sqs_msg).to receive(:renew_visibility).with(receive_visibility_timeout)
 
       Runner.new.run_and_sleep(TestWorker.new, queue, sqs_msg, 1.5)
     end
@@ -145,7 +235,7 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
       Shoryuken.add_queue(queue, 1, 'custom')
       Shoryuken.sqs_client_receive_message_opts['custom'] = { visibility_timeout: receive_visibility_timeout }
 
-      expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: receive_visibility_timeout)
+      expect(sqs_msg).to receive(:renew_visibility).with(receive_visibility_timeout)
 
       Runner.new.run_and_sleep(TestWorker.new, queue, sqs_msg, 1.5)
     end
@@ -153,7 +243,7 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
     it 'uses the queue visibility timeout when the receive options do not set one' do
       Shoryuken.sqs_client_receive_message_opts[queue] = { wait_time_seconds: 1 }
 
-      expect(sqs_msg).to receive(:change_visibility).with(visibility_timeout: visibility_timeout)
+      expect(sqs_msg).to receive(:renew_visibility).with(visibility_timeout)
 
       Runner.new.run_and_sleep(TestWorker.new, queue, sqs_msg, visibility_timeout)
     end
@@ -165,7 +255,7 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
 
       allow(sqs_msg).to receive(:queue) { sqs_queue }
       allow(sqs_msg).to receive(:message_id).and_return('test-message-id')
-      allow(sqs_msg).to receive(:change_visibility).and_raise(StandardError, 'AWS error')
+      allow(sqs_msg).to receive(:renew_visibility).and_raise(StandardError, 'AWS error')
 
       expect(Shoryuken.logger).to receive(:error) do |&block|
         msg = block.call
@@ -184,7 +274,7 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
 
       allow(sqs_msg).to receive(:queue) { sqs_queue }
       allow(sqs_msg).to receive(:message_id).and_return('test-message-id')
-      allow(sqs_msg).to receive(:change_visibility)
+      allow(sqs_msg).to receive(:renew_visibility)
 
       expect(Shoryuken.logger).to receive(:debug) do |&block|
         msg = block.call
@@ -206,7 +296,7 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
       TestWorker.get_shoryuken_options['auto_visibility_timeout'] = true
       allow(sqs_msg).to receive(:queue) { sqs_queue }
       allow(sqs_msg).to receive(:message_id).and_return('test-message-id')
-      allow(sqs_msg).to receive(:change_visibility)
+      allow(sqs_msg).to receive(:renew_visibility)
 
       ran = false
       subject.call(TestWorker.new, queue, sqs_msg, sqs_msg.body) { ran = true }
@@ -222,7 +312,7 @@ RSpec.describe Shoryuken::Middleware::Server::AutoExtendVisibility do
       TestWorker.get_shoryuken_options['auto_visibility_timeout'] = true
       allow(sqs_msg).to receive(:queue) { sqs_queue }
       allow(sqs_msg).to receive(:message_id).and_return('test-message-id')
-      expect(sqs_msg).not_to receive(:change_visibility)
+      expect(sqs_msg).not_to receive(:renew_visibility)
       expect(Shoryuken.logger).to receive(:warn)
 
       ran = false

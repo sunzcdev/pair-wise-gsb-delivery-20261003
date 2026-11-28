@@ -1,5 +1,12 @@
 ## [Unreleased]
 
+- Fix: A job's last visibility change is now its own delete or release, not an auto-extension that lands after it
+  - `auto_visibility_timeout` extends a message from a timer thread; when a job finished while an extension was still in
+    flight, the timer was only killed locally, so the issued extension could reach SQS after the job's delete or
+    `visibility_timeout = 0` release and hide the message again
+  - A renewal already in flight now finishes before the terminal change, and no renewal is sent once the message's
+    visibility is settled; other in-flight messages keep renewing normally
+
 - Fix: `perform_async`, `perform_in` and `perform_at` of a raw worker with several queues (an Array, or a lambda that
   returns several) raise an `ArgumentError` that names the worker and its queues and asks for `queue:` when called
   without `queue:`
