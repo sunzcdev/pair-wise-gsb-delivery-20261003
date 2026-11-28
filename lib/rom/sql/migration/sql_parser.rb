@@ -27,6 +27,8 @@ module ROM
       # 7. Each section concludes with an end directive
       # 8. Down migrations are optional, but they always must follow the up migration
       # 9. Empty sections (begin..end with no SQL body) are silently skipped
+      # 10. A checkpoint directive may appear between sections to declare a
+      #     verifiable step boundary (see "Resumable migrations")
       #
       # Recognized settings:
       #
@@ -40,6 +42,34 @@ module ROM
       #   section's body. Default is to send the entire body to the database in a
       #   single call. Any other value raises `SQLParseError`. Unknown begin keys
       #   are silently ignored.
+      #
+      # Resumable migrations:
+      #
+      # * A migration that must run outside a transaction (`transaction=false`)
+      #   can mark verifiable step boundaries with a checkpoint directive placed
+      #   between sections:
+      #
+      #       -- @migrate checkpoint verify="SELECT ..."
+      #
+      #   The `verify` query must return at least one row when the preceding
+      #   step's effects are in place. On a re-run after a failure, recorded
+      #   steps whose verification still holds are skipped and only the
+      #   remaining steps execute.
+      # * Progress is persisted in the `rom_sql_migration_checkpoints` table
+      #   together with a SHA-256 checksum of the migration file. Editing the
+      #   file after an interrupted run makes the stored checksum mismatch and
+      #   raises `MigrationResumeError`; the migration must be repaired
+      #   manually rather than resumed against a different script.
+      # * A recorded step whose verification query no longer returns a row
+      #   raises `MigrationCheckpointError`: the persisted progress does not
+      #   match the target state.
+      # * Checkpoints are only meaningful outside a transaction, so a
+      #   checkpoint directive in a migration without `transaction=false`
+      #   raises `SQLParseError`. Ordinary transactional migrations keep
+      #   running statement-by-statement without any persisted state.
+      # * The verification SQL is a double-quoted string. Backslash escapes
+      #   `\"` and `\\` are honored inside it; no other directive may share
+      #   the checkpoint line.
       #
       # Variable substitution:
       #
@@ -95,23 +125,28 @@ module ROM
       #     up-direction   = up-line   1*sql-section
       #     down-direction = down-line 1*sql-section
       #     sql-section    = begin-line *sql-line end-line
+      #                      [checkpoint-line]
       #
       #     ; Direction directives take no settings; only trailing whitespace
       #     ; may follow.
       #
-      #     up-line   = "-- @migrate up"   trailer newline
-      #     down-line = "-- @migrate down" trailer newline
-      #     end-line  = "-- @migrate end"  trailer newline
+      #     up-line         = "-- @migrate up"   trailer newline
+      #     down-line       = "-- @migrate down" trailer newline
+      #     end-line        = "-- @migrate end"  trailer newline
+      #     checkpoint-line = "-- @migrate checkpoint" gap
+      #                       "verify=" quoted-string trailer newline
       #
       #     ; begin and pragma lines may carry whitespace-separated settings.
       #
       #     begin-line  = "-- @migrate begin" *( gap setting ) trailer newline
       #     pragma-line = "-- @migrate"       *( gap setting ) trailer newline
       #
-      #     setting   = word "=" word
-      #     word      = 1*word-char
-      #     word-char = ALPHA / DIGIT / "_"
-      #     sql-line  = 1*line-char newline
+      #     setting        = word "=" word
+      #     quoted-string  = DQUOTE *( unescaped / ESC escapee ) DQUOTE
+      #     escapee        = DQUOTE / "\"
+      #     word           = 1*word-char
+      #     word-char      = ALPHA / DIGIT / "_"
+      #     sql-line       = 1*line-char newline
       #
       #     ; Terminals
       #
@@ -148,9 +183,15 @@ module ROM
           [:down, /\A(?<value>-- @migrate down)\b/i],
           [:begin, /\A(?<value>-- @migrate begin)\b/i],
           [:end, /\A(?<value>-- @migrate end)\b/i],
+          [:checkpoint, /\A(?<value>-- @migrate checkpoint)\b/i],
           [:pragma, /\A(?<value>-- @migrate)\b/i],
           [:setting, /\A[ \t]+(?<value>\w+=\w+)\b/i],
         ]
+
+        # Matches the required `verify="..."` pair following a checkpoint
+        # directive. Backslash escapes (`\"`, `\\`) are honored so a
+        # verification query may contain quotes.
+        CHECKPOINT_VERIFY = /\A[ \t]+verify="(?<value>(?:\\.|[^"\\])*)"/m
 
         TRAILING_WHITESPACE = /\A[ \t]*(?:\n|\z)/
 
@@ -188,9 +229,9 @@ module ROM
             raise SQLParseError, "No @migrate directives found in #{path}"
           end
 
-          settings = parse_pragmas(tokens)
-          up       = parse_up(tokens)
-          down     = parse_down(tokens)
+          settings   = parse_pragmas(tokens)
+          up_sections, up_checkpoints = parse_direction(:up, tokens)
+          down_sections, down_checkpoints = parse_direction(:down, tokens)
 
           if (stray = tokens.first)
             raise SQLParseError,
@@ -198,7 +239,20 @@ module ROM
                   "#{stray.type} at #{location(path, stray.line, stray.pos)}"
           end
 
-          attributes = { filename: path, settings:, up:, down: }.compact
+          validate_checkpoint_settings(settings, up_checkpoints + down_checkpoints)
+
+          attributes = {
+            filename: path,
+            settings: settings,
+            up: flatten(up_sections)
+          }
+
+          unless down_sections.empty?
+            attributes[:down] = flatten(down_sections)
+          end
+
+          steps = build_steps(up_sections, up_checkpoints, down_sections, down_checkpoints)
+          attributes[:steps] = steps unless steps.empty?
 
           SQLMigration.new(**attributes)
         end
@@ -235,6 +289,15 @@ module ROM
                   pos: lpos + match_data.begin(:value)
                 )
                 lpos += match_data.end(0)
+
+                # A checkpoint directive carries an inline quoted
+                # verification query; consume the rest of the line as a
+                # single verify token rather than lexing it as settings.
+                if match_type == :checkpoint
+                  verify, consumed = parse_checkpoint_verify(remainder[lpos..], lno)
+                  tokens << Token.new(verify, type: :verify, line: lno, pos: lpos)
+                  lpos += consumed
+                end
               elsif lpos.zero?
                 # No directive matched at start of line: treat as a SQL line.
                 tokens << Token.new(line.chomp(NEWLINE), type: :line, line: lno, pos: lpos)
@@ -252,6 +315,34 @@ module ROM
           end
 
           tokens
+        end
+
+        # Parse the `verify="..."` pair that must follow a checkpoint
+        # directive, returning the unescaped query and the number of
+        # characters consumed from the line remainder.
+        #
+        # @api private
+        def parse_checkpoint_verify(remainder, lno)
+          match = remainder.match(CHECKPOINT_VERIFY) or
+            raise SQLParseError,
+                  "Checkpoint directive requires a verify=\"...\" pair " \
+                  "at #{location(@path, lno, 0)}"
+
+          trailing = remainder[match.end(0)..]
+          unless trailing.nil? || trailing.match?(TRAILING_WHITESPACE)
+            raise SQLParseError,
+                  "Unrecognized content #{trailing.chomp.inspect} after " \
+                  "checkpoint verify at #{location(@path, lno, match.end(0))}"
+          end
+
+          [unescape(match[:value]), match.end(0)]
+        end
+
+        # Decode the backslash escapes accepted inside a quoted verify value.
+        #
+        # @api private
+        def unescape(value)
+          value.gsub(/\\(.)/, '\1')
         end
 
         def parse_pragmas(tokens)
@@ -294,31 +385,93 @@ module ROM
           [key.to_sym, value]
         end
 
-        def parse_up(tokens)
-          consume(:up, tokens)
-          parse_sections(tokens)
-        end
-
-        def parse_down(tokens)
-          return unless next?(:down, tokens)
-
-          consume(:down, tokens)
-          parse_sections(tokens)
-        end
-
-        # Parse one or more consecutive `-- @migrate begin..end` sections for
-        # the current direction and return their statements as a single flat
-        # array.
+        # Parse a full direction (`up` is required, `down` optional),
+        # returning its sections and `[section_index, verify_token]`
+        # checkpoint pairs in source order.
+        #
+        # @return [Array(Array<Array<Statement>>, Array<Array(Integer, Token)>)]
         #
         # @api private
-        def parse_sections(tokens)
-          statements = parse_sql(tokens)
+        def parse_direction(name, tokens)
+          return [[], []] if name == :down && !next?(:down, tokens)
+
+          consume(name, tokens)
+
+          sections = []
+          checkpoints = []
 
           while next?(:begin, tokens)
-            statements += parse_sql(tokens)
+            index = sections.length
+            sections << parse_sql(tokens)
+
+            if next?(:checkpoint, tokens)
+              consume(:checkpoint, tokens)
+              checkpoints << [index, consume(:verify, tokens)]
+            end
           end
 
-          statements
+          [sections, checkpoints]
+        end
+
+        # @api private
+        def validate_checkpoint_settings(settings, checkpoints)
+          return if checkpoints.empty?
+
+          if (_, verify = checkpoints.first) && verify.value.strip.empty?
+            raise SQLParseError,
+                  "Checkpoint verify query cannot be empty " \
+                  "at #{verify.line_pos} in #{@path}"
+          end
+
+          return if settings[:transaction] == false
+
+          _, first_verify = checkpoints.first
+
+          raise SQLParseError,
+                "Checkpoint directives require transaction=false so that " \
+                "completed steps stay committed if a later step fails " \
+                "(found at #{first_verify.line_pos} in #{@path})"
+        end
+
+        # Build per-direction `Step` lists from parsed sections. A
+        # checkpoint following a section closes that section's step; a
+        # section without one forms a step with no verification.
+        #
+        # @api private
+        def build_steps(up_sections, up_checkpoints, down_sections, down_checkpoints)
+          steps = {}
+
+          if up_checkpoints.any?
+            steps[:up] = steps_for(up_sections, up_checkpoints)
+          end
+          if down_checkpoints.any?
+            steps[:down] = steps_for(down_sections, down_checkpoints)
+          end
+
+          steps
+        end
+
+        # @api private
+        def steps_for(sections, checkpoint_pairs)
+          checkpoints_by_index = checkpoint_pairs.to_h { |index, token|
+            [index, Checkpoint.new(verify: token.value, line: token.line)]
+          }
+
+          sections.each_with_index.map do |statements, index|
+            Step.new(
+              index: index,
+              statements: statements,
+              checkpoint: checkpoints_by_index[index]
+            )
+          end
+        end
+
+        # Flatten section statement lists into the single array stored by
+        # `SQLMigration#up`/`#down`, preserving source order.
+        #
+        # @api private
+        def flatten(sections)
+          sections.flatten
         end
 
         # Parse a single `begin..end` section into an array of `Statement`s,

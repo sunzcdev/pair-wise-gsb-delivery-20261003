@@ -707,4 +707,301 @@ RSpec.describe ROM::SQL::Migration::SQLParser do
       end
     end
   end
+
+  describe "resumable migrations with checkpoints" do
+    let(:checkpoint_table) { ROM::SQL::Migration::CheckpointRunner::TABLE }
+
+    let(:migration_source) do
+      <<~SQL
+        -- @migrate transaction=false
+        -- @migrate up
+        -- @migrate begin
+        CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)
+        -- @migrate end
+        -- @migrate checkpoint verify="SELECT name FROM sqlite_master WHERE type='table' AND name='widgets'"
+        -- @migrate begin split=line
+        INSERT INTO widgets (name) VALUES ('a')
+        INSERT INTO widgets (name) VALUES ('b')
+        -- @migrate end
+        -- @migrate checkpoint verify="SELECT * FROM widgets WHERE name='b'"
+      SQL
+    end
+
+    # A connection wrapper that fails the next execution containing
+    # `failing_sql`, emulating a crash inside a segment while leaving the
+    # migration file untouched.
+    let(:flaky_db_class) do
+      Class.new(SimpleDelegator) do
+        def initialize(db, failing_sql)
+          super(db)
+          @db = db
+          @failing_sql = failing_sql
+          @armed = true
+        end
+
+        def run(sql, *args, &block)
+          if @armed && sql.include?(@failing_sql)
+            @armed = false
+            raise Sequel::DatabaseError, "injected failure"
+          end
+          @db.run(sql, *args, &block)
+        end
+      end
+    end
+
+    it "parses checkpoint directives into verifiable steps" do
+      with_sql(migration_source) do |path|
+        migration = parser.call(path)
+
+        expect(migration).to be_checkpoints
+        expect(migration.steps[:up].map(&:index)).to eq([0, 1])
+        expect(migration.steps[:up].first.checkpoint.verify)
+          .to include("sqlite_master")
+        expect(migration.steps[:up].last.statements.map { |s| s.sql })
+          .to eq([
+                   "INSERT INTO widgets (name) VALUES ('a')",
+                   "INSERT INTO widgets (name) VALUES ('b')"
+                 ])
+      end
+    end
+
+    it "records one checkpoint row per executed statement" do
+      with_sql(migration_source) do |path|
+        parser.call(path).apply(db, :up)
+
+        expect(db[checkpoint_table].where(direction: "up").count).to eq(3)
+        expect(db[checkpoint_table].where(step_index: 1).map(:statement_offset))
+          .to eq([0, 1])
+      end
+    end
+
+    it "resumes with the same script by re-running only the remaining statements" do
+      with_sql(migration_source) do |path|
+        flaky = flaky_db_class.new(db, "VALUES ('b')")
+
+        expect { parser.call(path).apply(flaky, :up) }
+          .to raise_error(Sequel::DatabaseError, /injected failure/)
+
+        # The first segment and the second segment's first statement are
+        # durable; the failing statement never recorded a checkpoint.
+        expect(db.table_exists?(:widgets)).to be(true)
+        expect(db[:widgets].all.map { |row| row[:name] }).to eq(["a"])
+        expect(db[checkpoint_table].where(direction: "up").count).to eq(2)
+
+        parser.call(path).apply(db, :up)
+
+        expect(db[:widgets].order(:id).all.map { |row| row[:name] })
+          .to eq(%w[a b])
+        # Step 0 and its statements were verified and skipped, so no action
+        # ran twice: exactly two rows exist.
+        expect(db[:widgets].count).to eq(2)
+        expect(db[checkpoint_table].where(direction: "up").count).to eq(3)
+      end
+    end
+
+    it "is idempotent once every step is complete" do
+      with_sql(migration_source) do |path|
+        parser.call(path).apply(db, :up)
+        parser.call(path).apply(db, :up)
+
+        expect(db[:widgets].count).to eq(2)
+      end
+    end
+
+    it "refuses to resume when the migration file has been replaced" do
+      with_sql(migration_source) do |path|
+        flaky = flaky_db_class.new(db, "VALUES ('b')")
+
+        expect { parser.call(path).apply(flaky, :up) }
+          .to raise_error(Sequel::DatabaseError)
+
+        File.write(path, migration_source.gsub("'a'", "'alpha'"))
+
+        expect { parser.call(path).apply(db, :up) }
+          .to raise_error(
+            ROM::SQL::MigrationResumeError,
+            /has changed since its interrupted run/
+          )
+        expect(db[checkpoint_table].where(direction: "up").count).to eq(2)
+      end
+    end
+
+    it "raises when a recorded step's verification no longer holds" do
+      with_sql(migration_source) do |path|
+        migration = parser.call(path)
+        runner = ROM::SQL::Migration::CheckpointRunner.new(db)
+        checksum = Digest::SHA256.file(path).hexdigest
+
+        runner.send(:ensure_table)
+        step = migration.steps[:up].first
+        step.statements.each { |statement| db.run(statement.sql) }
+        runner.send(:record, migration, :up, step, 0, checksum)
+
+        db.drop_table(:widgets)
+
+        expect { parser.call(path).apply(db, :up) }
+          .to raise_error(
+            ROM::SQL::MigrationCheckpointError,
+            /verification query returned no rows/
+          )
+      end
+    end
+
+    it "rejects checkpoints unless transaction=false is declared" do
+      with_sql(migration_source.sub("-- @migrate transaction=false\n", "")) do |path|
+        expect { parser.call(path) }.to raise_error(
+          ROM::SQL::SQLParseError, /transaction=false/
+        )
+      end
+    end
+
+    it "requires a quoted verify query on a checkpoint directive" do
+      with_sql(<<~SQL) do |path|
+        -- @migrate transaction=false
+        -- @migrate up
+        -- @migrate begin
+        CREATE TABLE x (id INTEGER PRIMARY KEY)
+        -- @migrate end
+        -- @migrate checkpoint
+      SQL
+        expect { parser.call(path) }.to raise_error(
+          ROM::SQL::SQLParseError, /verify/
+        )
+      end
+    end
+
+    it "rejects an empty verify query" do
+      with_sql(<<~SQL) do |path|
+        -- @migrate transaction=false
+        -- @migrate up
+        -- @migrate begin
+        CREATE TABLE x (id INTEGER PRIMARY KEY)
+        -- @migrate end
+        -- @migrate checkpoint verify=""
+      SQL
+        expect { parser.call(path) }.to raise_error(
+          ROM::SQL::SQLParseError, /verify query cannot be empty/
+        )
+      end
+    end
+
+    it "rejects stray content after the checkpoint verify query" do
+      with_sql(<<~SQL) do |path|
+        -- @migrate transaction=false
+        -- @migrate up
+        -- @migrate begin
+        CREATE TABLE x (id INTEGER PRIMARY KEY)
+        -- @migrate end
+        -- @migrate checkpoint verify="SELECT 1" unexpected
+      SQL
+        expect { parser.call(path) }.to raise_error(
+          ROM::SQL::SQLParseError, /Unrecognized content/
+        )
+      end
+    end
+
+    it "honors backslash escapes inside the quoted verify query" do
+      with_sql(<<~'SQL') do |path|
+        -- @migrate transaction=false
+        -- @migrate up
+        -- @migrate begin
+        CREATE TABLE quotes (note TEXT)
+        -- @migrate end
+        -- @migrate checkpoint verify="SELECT * FROM quotes WHERE note='a\"b'"
+      SQL
+        migration = parser.call(path)
+
+        expect(migration.steps[:up].first.checkpoint.verify)
+          .to eq(%(SELECT * FROM quotes WHERE note='a"b'))
+      end
+    end
+
+    it "keeps separate progress per direction" do
+      source = <<~SQL
+        -- @migrate transaction=false
+        -- @migrate up
+        -- @migrate begin
+        CREATE TABLE lifecycle (id INTEGER PRIMARY KEY)
+        -- @migrate end
+        -- @migrate checkpoint verify="SELECT name FROM sqlite_master WHERE type='table' AND name='lifecycle'"
+        -- @migrate down
+        -- @migrate begin
+        DROP TABLE lifecycle
+        -- @migrate end
+        -- @migrate checkpoint verify="SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='lifecycle')"
+      SQL
+
+      with_sql(source) do |path|
+        migration = parser.call(path)
+        migration.apply(db, :up)
+        migration.apply(db, :down)
+
+        expect(db.table_exists?(:lifecycle)).to be(false)
+        expect(db[checkpoint_table].where(direction: "up").count).to eq(1)
+        expect(db[checkpoint_table].where(direction: "down").count).to eq(1)
+      end
+    end
+
+    it "does not create checkpoint state for ordinary migrations without checkpoints" do
+      with_sql(<<~SQL) do |path|
+        -- @migrate up
+        -- @migrate begin
+        CREATE TABLE plain (id INTEGER PRIMARY KEY)
+        -- @migrate end
+      SQL
+        migration = parser.call(path)
+        migration.apply(db, :up)
+
+        expect(migration.steps).to be_empty
+        expect(db.table_exists?(checkpoint_table)).to be(false)
+      end
+    end
+
+    describe "with env=true substitution" do
+      around do |example|
+        saved = ENV.to_h
+        example.run
+      ensure
+        ENV.replace(saved)
+      end
+
+      it "substitutes variables in both statements and verify queries" do
+        ENV["MIG_TABLE"] = "env_widgets"
+
+        with_sql(<<~SQL) do |path|
+          -- @migrate transaction=false env=true
+          -- @migrate up
+          -- @migrate begin
+          CREATE TABLE ${MIG_TABLE} (id INTEGER PRIMARY KEY)
+          -- @migrate end
+          -- @migrate checkpoint verify="SELECT name FROM sqlite_master WHERE type='table' AND name='${MIG_TABLE}'"
+        SQL
+          parser.call(path).apply(db, :up)
+
+          expect(db.tables).to include(:env_widgets)
+          expect(db[checkpoint_table].count).to eq(1)
+        end
+      end
+
+      it "aborts before side effects when a verify variable is missing" do
+        ENV.delete("MIG_MISSING")
+
+        with_sql(<<~SQL) do |path|
+          -- @migrate transaction=false env=true
+          -- @migrate up
+          -- @migrate begin
+          CREATE TABLE present (id INTEGER PRIMARY KEY)
+          -- @migrate end
+          -- @migrate checkpoint verify="SELECT * FROM ${MIG_MISSING}"
+        SQL
+          expect { parser.call(path).apply(db, :up) }
+            .to raise_error(ROM::SQL::SQLEnvError, /\$\{MIG_MISSING\}/)
+          # The statement ran and recorded progress, but the unresolved
+          # verify never executed against the database.
+          expect(db.table_exists?(:present)).to be(true)
+          expect(db[checkpoint_table].count).to eq(1)
+        end
+      end
+    end
+  end
 end

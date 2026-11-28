@@ -21,6 +21,8 @@ module ROM
     UnsupportedConversion     = Class.new(MigrationError)
     SQLParseError             = Class.new(MigrationError)
     SQLEnvError               = Class.new(MigrationError)
+    MigrationCheckpointError  = Class.new(MigrationError)
+    MigrationResumeError      = Class.new(MigrationError)
 
     ERROR_MAP = {
       Sequel::DatabaseError => DatabaseError,
