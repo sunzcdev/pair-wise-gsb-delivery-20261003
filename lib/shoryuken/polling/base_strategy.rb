@@ -57,13 +57,31 @@ module Shoryuken
       # Strategies can use this information to make decisions about future polling behavior, such as pausing empty queues or
       # adjusting queue weights.
       #
+      # A report with 0 messages means SQS answered the request with an empty list. It is not the same as a queue that was
+      # selected but never requested because the group had no free processor: that is reported through {#poll_skipped}.
+      #
+      # The poll id identifies the selection the report answers (see {QueueConfiguration#poll_id}). A subclass that tracks
+      # it can drop a report about a state the queue has already left.
+      #
       # @abstract Subclasses must implement this method
       # @param _queue [String] The name of the queue that was polled
       # @param _messages_found [Integer] The number of messages retrieved
+      # @param _poll_id [Integer, nil] The id of the selection this report answers, when the caller tracks it
       # @raise [NotImplementedError] if not implemented by subclass
-      def messages_found(_queue, _messages_found)
+      def messages_found(_queue, _messages_found, _poll_id = nil)
         fail NotImplementedError
       end
+
+      # Called when a queue was selected but not requested because the group had no free processor.
+      #
+      # Unlike an empty report from SQS, this is not a statement about the queue's contents, so a strategy that pauses or
+      # reweights queues on empty reports must leave its state untouched here. The default implementation does nothing,
+      # so strategies that are happy with the default need not override it.
+      #
+      # @param _queue [String] The name of the queue that was selected
+      # @param _poll_id [Integer, nil] The id of the selection that was skipped, when the caller tracks it
+      # @return [void]
+      def poll_skipped(_queue, _poll_id = nil); end
 
       # Called when a message from a queue has been processed.
       #

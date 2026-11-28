@@ -55,6 +55,23 @@ module Shoryuken
         end
       end
 
+      # Handles a selection that was not polled because the group had no free processor
+      #
+      # next_queue already advanced past the selected queue. A turn that was never taken must not demote it, so the
+      # cursor is reset to that queue: the next call returns it again once the group has capacity.
+      #
+      # @param queue [String, QueueConfiguration] the queue name, or the selection that was skipped
+      # @param _poll_id [Integer, nil] unused by this strategy, accepted for symmetry with {#messages_found}
+      # @return [void]
+      def poll_skipped(queue, _poll_id = nil)
+        name = queue.is_a?(QueueConfiguration) ? queue.name : queue
+
+        @mutex.synchronize do
+          index = @queues.index(name)
+          @next_queue_index = index if index
+        end
+      end
+
       # Returns the list of active (non-paused) queues with their priorities
       #
       # @return [Array<Array>] array of [queue_name, priority] pairs

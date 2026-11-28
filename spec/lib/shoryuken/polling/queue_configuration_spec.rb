@@ -162,6 +162,38 @@ RSpec.describe Shoryuken::Polling::QueueConfiguration do
       expect(config[0]).to eq('queue')
       expect(config[1]).to eq({ weight: 5 })
     end
+
+    it 'carries the poll id of the selection it describes' do
+      config = described_class.new('queue', {}, 4)
+
+      expect(config.poll_id).to eq(4)
+    end
+
+    it 'leaves the poll id unset when none is given' do
+      expect(described_class.new('queue', {}).poll_id).to be_nil
+    end
+  end
+
+  describe 'poll id and equality' do
+    it 'ignores the poll id when comparing two configurations' do
+      plain = described_class.new('queue', {})
+      selected = described_class.new('queue', {}, 7)
+
+      expect(selected).to eq(plain)
+      expect(plain).to eq(selected)
+      expect(selected.eql?(plain)).to be true
+    end
+
+    it 'still compares equal to the plain queue name' do
+      expect(described_class.new('queue', {}, 7)).to eq('queue')
+    end
+
+    it 'hashes only on the queue name' do
+      plain = described_class.new('queue', {})
+      selected = described_class.new('queue', {}, 7)
+
+      expect(selected.hash).to eq(plain.hash)
+    end
   end
 
   describe 'usage as hash key' do

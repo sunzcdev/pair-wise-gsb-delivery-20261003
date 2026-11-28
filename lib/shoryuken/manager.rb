@@ -125,7 +125,17 @@ module Shoryuken
     def dispatch
       return unless running?
 
-      if ready <= 0 || (queue = @polling_strategy.next_queue).nil?
+      # Without a free processor nothing is requested. Strategies that model a skipped selection are told about the
+      # queue they would have polled, so a shortage of local capacity is not mistaken for an empty queue; the others are
+      # left alone, exactly as before.
+      if ready <= 0
+        skip_selection
+        return sleep(MIN_DISPATCH_INTERVAL)
+      end
+
+      queue = @polling_strategy.next_queue
+
+      if queue.nil?
         return sleep(MIN_DISPATCH_INTERVAL)
       end
 
@@ -138,6 +148,77 @@ module Shoryuken
       handle_dispatch_error(e)
     ensure
       dispatch_loop
+    end
+
+    # Tells the strategy which queue it would have polled, when it models skipped selections
+    #
+    # Only a strategy that implements its own {Shoryuken::Polling::BaseStrategy#poll_skipped} is asked: for the others a
+    # selection made now would advance their rotation for a turn they cannot account for, which is worse than leaving
+    # them with the previous behaviour of not being asked at all.
+    #
+    # @return [void]
+    def skip_selection
+      return unless skip_callback?
+
+      queue = @polling_strategy.next_queue
+      report_poll_skipped(queue) unless queue.nil?
+    end
+
+    # Checks whether the strategy implements its own skipped-selection callback
+    #
+    # @return [Boolean] true when the strategy overrides the base strategy's no-op callback
+    def skip_callback?
+      return false unless @polling_strategy.respond_to?(:poll_skipped)
+
+      @polling_strategy.method(:poll_skipped).owner != Shoryuken::Polling::BaseStrategy
+    end
+
+    # Reports the messages an SQS request returned, tagged with the selection it answered
+    #
+    # The poll id lets the strategy discard a report that arrives after the queue has recovered, so an older empty
+    # response cannot pause a queue that has already recovered.
+    #
+    # @param queue [Shoryuken::Polling::QueueConfiguration] the queue configuration that was polled
+    # @param messages_found [Integer] the number of messages the request returned
+    # @return [void]
+    def report_messages_found(queue, messages_found)
+      callback = @polling_strategy.method(:messages_found)
+      args = [queue.name, messages_found]
+      args << queue.poll_id if accepts_argument?(callback, args.size)
+
+      callback.call(*args)
+    end
+
+    # Reports a selection that was not polled because no processor is free
+    #
+    # Strategies that cannot tell a skipped selection from an empty response would otherwise pause or reweight a queue
+    # that was never asked. Custom strategies that do not implement the callback are left alone.
+    #
+    # @param queue [Shoryuken::Polling::QueueConfiguration] the selected queue configuration
+    # @return [void]
+    def report_poll_skipped(queue)
+      return unless @polling_strategy.respond_to?(:poll_skipped)
+
+      callback = @polling_strategy.method(:poll_skipped)
+      args = [queue.name]
+      args << queue.poll_id if accepts_argument?(callback, args.size)
+
+      callback.call(*args)
+    end
+
+    # Checks whether a strategy callback accepts one more positional argument than it is already being given
+    #
+    # The strategy callbacks gained an optional poll id argument. A custom strategy written against the older, shorter
+    # signature must keep working, so the extra argument is only passed to callbacks that can take it.
+    #
+    # @param method [Method] the strategy callback
+    # @param given [Integer] the number of positional arguments already prepared for the call
+    # @return [Boolean] true when the callback can also receive the poll id
+    def accepts_argument?(method, given)
+      parameters = method.parameters
+      return true if parameters.any? { |type, _name| type == :rest }
+
+      parameters.count { |type, _name| type == :req || type == :opt } > given
     end
 
     # Returns the count of busy processors
@@ -243,7 +324,7 @@ module Shoryuken
     # @return [void]
     def dispatch_batch(queue)
       batch = @fetcher.fetch(queue, BATCH_LIMIT)
-      @polling_strategy.messages_found(queue.name, batch.size)
+      report_messages_found(queue, batch.size)
       assign(queue.name, patch_batch!(batch)) if batch.any?
     end
 
@@ -253,7 +334,7 @@ module Shoryuken
     # @return [void]
     def dispatch_single_messages(queue)
       messages = @fetcher.fetch(queue, ready)
-      @polling_strategy.messages_found(queue.name, messages.size)
+      report_messages_found(queue, messages.size)
       messages.each { |message| assign(queue.name, message) }
     end
 

@@ -96,6 +96,161 @@ RSpec.describe Shoryuken::Polling::WeightedRoundRobin do
     end
   end
 
+  describe '#poll_skipped' do
+    it 'keeps the weight of a queue that was not polled' do
+      queues << queue1
+      queues << queue1
+      queues << queue2
+
+      selection = subject.next_queue
+      expect(selection.name).to eq(queue1)
+
+      subject.poll_skipped(selection)
+
+      expect(subject.active_queues.to_h).to eq(queue1 => 1, queue2 => 1)
+    end
+
+    it 'does not pause the queue' do
+      queues << queue1
+      queues << queue2
+
+      selection = subject.next_queue
+      subject.poll_skipped(selection)
+
+      expect(subject.active_queues.map(&:first)).to include(queue1)
+      expect(subject.next_queue).not_to be_nil
+    end
+
+    it 'gives the unused turn back, so the skipped queue is the next candidate' do
+      queues << queue1
+      queues << queue2
+
+      selection = subject.next_queue
+      subject.poll_skipped(selection)
+
+      expect(subject.next_queue.name).to eq(queue1)
+      expect(subject.next_queue.name).to eq(queue2)
+    end
+
+    it 'does not lower the weight grown by an earlier poll' do
+      queues << queue1
+      queues << queue1
+      queues << queue2
+
+      subject.messages_found(queue1, 2)
+      expect(subject.active_queues).to eq([[queue1, 2], [queue2, 1]])
+
+      selection = subject.next_queue
+      subject.poll_skipped(selection)
+
+      expect(subject.active_queues.to_h).to eq(queue1 => 2, queue2 => 1)
+    end
+
+    it 'keeps the recovered weight available for the next polls of the queue' do
+      queues << queue1
+      queues << queue1
+      queues << queue2
+
+      subject.messages_found(queue1, 2)
+
+      # The group runs out of capacity right after the queue recovered its weight
+      skipped = subject.next_queue
+      expect(skipped.name).to eq(queue1)
+      subject.poll_skipped(skipped)
+
+      # The skipped turn is given back: the queue still leads with its recovered weight of 2
+      names = Array.new(3) { subject.next_queue.name }
+      expect(names).to eq([queue1, queue2, queue1])
+    end
+  end
+
+  describe 'stale reports' do
+    it 'ignores an empty report for a queue that has already been selected again' do
+      queues << queue1
+      queues << queue2
+
+      first = subject.next_queue
+      subject.messages_found(first, 2) # queue1 recovers and grows to its weight
+
+      second = subject.next_queue # a newer selection of queue2
+      expect(second.name).to eq(queue2)
+
+      # A late answer for the first selection must not change the newer state
+      subject.messages_found(first, 0)
+
+      expect(subject.active_queues.to_h).to eq(queue1 => 1, queue2 => 1)
+    end
+
+    it 'does not pause a queue that recovered after an empty answer was requested' do
+      queues << queue1
+      queues << queue1
+      queues << queue2
+
+      stale = subject.next_queue
+      expect(stale.name).to eq(queue1)
+
+      # queue1 recovers in a later selection before the first answer arrives
+      recovered = subject.next_queue
+      expect(recovered.name).to eq(queue2)
+      subject.messages_found(queue1, 2)
+
+      subject.messages_found(stale, 0)
+
+      expect(subject.active_queues.to_h).to eq(queue1 => 2, queue2 => 1)
+    end
+
+    it 'ignores a report applied twice for the same selection' do
+      queues << queue1
+      queues << queue1
+
+      selection = subject.next_queue
+      subject.messages_found(selection, 2)
+      weight_after_first = subject.active_queues.to_h[queue1]
+
+      subject.messages_found(selection, 2)
+
+      expect(subject.active_queues.to_h[queue1]).to eq(weight_after_first)
+    end
+
+    it 'ignores an empty report from before a processed message resumed the queue' do
+      queues << queue1
+      queues << queue2
+
+      selection = subject.next_queue
+      subject.messages_found(selection, 0) # queue1 is paused by its own empty answer
+      expect(subject.active_queues.to_h).to eq(queue2 => 1)
+
+      subject.message_processed(queue1) # a message already in flight was processed
+      expect(subject.next_queue).not_to be_nil # implicitly unpauses queue1
+      expect(subject.active_queues.to_h).to eq(queue1 => 1, queue2 => 1)
+
+      # A second, older empty report for the same selection must not pause queue1 again
+      subject.messages_found(selection, 0)
+      expect(subject.active_queues.to_h).to eq(queue1 => 1, queue2 => 1)
+    end
+
+    it 'does not restart the backoff of an unpaused queue from the report that paused it' do
+      queues << queue1
+      queues << queue2
+
+      allow(subject).to receive(:delay).and_return(10)
+      now = Time.now
+      allow(Time).to receive(:now).and_return(now)
+
+      selection = subject.next_queue
+      subject.messages_found(selection, 0)
+      expect(subject.active_queues.to_h).to eq(queue2 => 1)
+
+      now += 11
+      allow(Time).to receive(:now).and_return(now)
+      expect(subject.next_queue).not_to be_nil # the backoff has passed
+
+      # Replaying the old empty answer must not pause the queue for another delay
+      subject.messages_found(selection, 0)
+      expect(subject.active_queues.map(&:first)).to include(queue1)
+    end
+  end
+
   describe '#delay' do
     it 'sets delay based on group' do
       delay_polling = Shoryuken::Polling::WeightedRoundRobin.new(queues, 25)

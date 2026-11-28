@@ -146,8 +146,31 @@ RSpec.describe Shoryuken::Polling::StrictPriority do
     end
   end
 
-  describe '#message_processed' do
-    it 'removes paused queue, adds to active queues' do
+  describe '#poll_skipped' do
+    it 'keeps the priority order when a selected queue was not polled' do
+      queues << queue1
+      queues << queue1
+      queues << queue2
+      queues << queue3
+
+      expect(subject.next_queue).to eq(queue1)
+      subject.poll_skipped(queue1)
+
+      # The skipped turn is given back: the same queue is the next candidate
+      expect(subject.next_queue).to eq(queue1)
+      expect(subject.next_queue).to eq(queue2)
+    end
+
+    it 'does not pause the queue' do
+      strategy = Shoryuken::Polling::StrictPriority.new([queue1, queue2], 10)
+      strategy.next_queue
+      strategy.poll_skipped(queue1)
+
+      expect(strategy.active_queues).to eq([[queue1, 2], [queue2, 1]])
+    end
+  end
+
+  describe '#message_processed' do    it 'removes paused queue, adds to active queues' do
       strategy = Shoryuken::Polling::StrictPriority.new([queue1, queue2])
       strategy.messages_found(queue1, 0)
       expect(strategy.active_queues).to eq([[queue2, 1]])

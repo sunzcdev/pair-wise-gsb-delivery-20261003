@@ -6,6 +6,27 @@ RSpec::Matchers.define :queue_config_of do |expected|
   end
 end
 
+# A custom strategy that keeps the original two-argument messages_found contract
+class CustomNameOnlyStrategy < Shoryuken::Polling::BaseStrategy
+  def initialize(queues, _delay = nil)
+    @queues = queues
+  end
+
+  def next_queue
+    Shoryuken::Polling::QueueConfiguration.new(@queues.first, {})
+  end
+
+  def messages_found(queue, messages_found)
+    @last_report = [queue, messages_found]
+  end
+
+  attr_reader :last_report
+
+  def active_queues
+    @queues.map { |queue| [queue, 1] }
+  end
+end
+
 RSpec.describe Shoryuken::Manager do
   let(:queue) { 'default' }
   let(:queues) { [queue] }
@@ -129,6 +150,85 @@ RSpec.describe Shoryuken::Manager do
       subject.send(:dispatch)
     end
 
+    context 'when no processor is free' do
+      let(:concurrency) { 1 }
+
+      it 'reports the selection as skipped instead of as an empty answer' do
+        q = Shoryuken::Polling::QueueConfiguration.new(queue, {}, 4)
+        allow(polling_strategy).to receive(:next_queue).and_return(q)
+        allow(subject).to receive(:ready).and_return(0)
+
+        expect(fetcher).not_to receive(:fetch)
+        expect(polling_strategy).not_to receive(:messages_found)
+        expect(polling_strategy).to receive(:poll_skipped).with(queue, 4)
+
+        subject.send(:dispatch)
+      end
+
+      it 'keeps the weight of a queue it could not poll' do
+        strategy = Shoryuken::Polling::WeightedRoundRobin.new(%w[busy busy idle], 30)
+        busy_manager = described_class.new('default', fetcher, strategy, 1, executor)
+
+        allow(busy_manager).to receive(:running?).and_return(true, true, false)
+        allow(busy_manager).to receive(:ready).and_return(0)
+        allow(busy_manager).to receive(:sleep)
+
+        busy_manager.send(:dispatch)
+
+        expect(strategy.active_queues.to_h).to eq('busy' => 1, 'idle' => 1)
+      end
+
+      it 'does not pause the queue, so the group can use it again as soon as capacity returns' do
+        strategy = Shoryuken::Polling::WeightedRoundRobin.new(%w[busy idle], 30)
+        busy_manager = described_class.new('default', fetcher, strategy, 1, executor)
+
+        allow(busy_manager).to receive(:running?).and_return(true, true, false)
+        allow(busy_manager).to receive(:ready).and_return(0)
+        allow(busy_manager).to receive(:sleep)
+
+        busy_manager.send(:dispatch)
+
+        expect(strategy.active_queues.to_h.keys).to contain_exactly('busy', 'idle')
+      end
+
+      it 'returns without reporting a skip when every queue is paused' do
+        allow(polling_strategy).to receive(:next_queue).and_return(nil)
+        allow(subject).to receive(:ready).and_return(0)
+        allow(subject).to receive(:sleep)
+
+        expect(polling_strategy).not_to receive(:poll_skipped)
+
+        subject.send(:dispatch)
+
+        expect(subject).to have_received(:sleep).with(described_class::MIN_DISPATCH_INTERVAL)
+      end
+
+      it 'does not select a queue for a strategy without a skipped-selection callback' do
+        # WeightedRoundRobin overrides poll_skipped; a bare BaseStrategy subclass does not
+        name_only = CustomNameOnlyStrategy.new(queues)
+        busy_manager = described_class.new('default', fetcher, name_only, 1, executor)
+        allow(busy_manager).to receive(:running?).and_return(true, true, false)
+        allow(busy_manager).to receive(:ready).and_return(0)
+        allow(busy_manager).to receive(:sleep)
+
+        expect(name_only).not_to receive(:next_queue)
+
+        busy_manager.send(:dispatch)
+      end
+    end
+
+    context 'with a custom strategy that takes only the queue name' do
+      let(:polling_strategy) { CustomNameOnlyStrategy.new(queues) }
+
+      it 'calls messages_found with just the queue name and the count' do
+        selection = Shoryuken::Polling::QueueConfiguration.new(queue, {}, 3)
+
+        subject.send(:dispatch_single_messages, selection)
+
+        expect(polling_strategy.last_report).to eq([queue, 0])
+      end
+    end
+
     context 'and there are no messages in the queue' do
       specify do
         messages = %w[]
@@ -136,7 +236,7 @@ RSpec.describe Shoryuken::Manager do
 
         expect(fetcher).to receive(:fetch).with(q, concurrency).and_return(messages)
         expect(subject).to receive(:fire_event).with(:dispatch, false, queue_name: q.name)
-        expect(polling_strategy).to receive(:messages_found).with(q.name, 0)
+        expect(polling_strategy).to receive(:messages_found).with(q.name, 0, anything)
         expect(Shoryuken.logger).to receive(:info).never
         expect(Shoryuken::Processor).to receive(:process).never
         expect_any_instance_of(described_class).to receive(:assign).never
@@ -173,10 +273,10 @@ RSpec.describe Shoryuken::Manager do
           messages = %w[]
           q = Shoryuken::Polling::QueueConfiguration.new(queue, {})
 
-          expect(fetcher).to receive(:fetch).with(q, described_class::BATCH_LIMIT).and_return(messages)
+          allow(fetcher).to receive(:fetch).with(q, described_class::BATCH_LIMIT).and_return(messages)
           expect(subject).to receive(:fire_event).with(:dispatch, false, queue_name: q.name)
           allow(subject).to receive(:batched_queue?).with(q).and_return(true)
-          expect(polling_strategy).to receive(:messages_found).with(q.name, 0)
+          expect(polling_strategy).to receive(:messages_found).with(q.name, 0, anything)
           expect(Shoryuken.logger).to receive(:info).never
           expect(Shoryuken::Processor).to receive(:process).never
           expect_any_instance_of(described_class).to receive(:assign).never

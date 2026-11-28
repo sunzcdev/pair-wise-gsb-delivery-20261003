@@ -1,5 +1,27 @@
 ## [Unreleased]
 
+- Fix: `WeightedRoundRobin` tells a selection that was never polled apart from an SQS answer that really was an empty
+  list
+  - A group with every processor busy used to select nothing and just wait, so a queue never polled looked the same as
+    one SQS reported empty; when the group did select one it could not poll, an empty report paused the queue for
+    `delay` and lowered its weight although SQS had never been asked
+  - When no processor is free, the manager now asks the strategy for the queue it would have polled and calls the new
+    `Shoryuken::Polling::BaseStrategy#poll_skipped`, so `WeightedRoundRobin#poll_skipped` leaves the weight and the
+    pause state untouched. A queue that was not asked keeps the weight it recovered and is not paused
+  - Queues that really answered empty keep backing off as before
+  - The callback is optional: a custom strategy that does not override it is polled for a queue only when capacity is
+    free, exactly as before. `StrictPriority#poll_skipped` restores its cursor so the skipped queue is returned next
+
+- Fix: `WeightedRoundRobin` ignores a report about a state the queue has already left
+  - A long poll can answer after the queue was selected again, or after a processed FIFO message resumed it. The
+    answer was applied to the newer state: an empty answer paused a queue that had already started recovering, and the
+    weight a later poll had raised was lost with it. Replaying an answer also restarted a backoff that had passed
+  - Every selection now carries a unique `QueueConfiguration#poll_id`. It moves on when the queue is selected again,
+    when an answer or a skip is applied, when its backoff expires and when a processed message resumes it; a report for
+    an older id is dropped
+  - `messages_found` accepts that id as an optional third argument. The manager passes it only to callbacks that take
+    it, so a custom strategy that defines the older two-argument method keeps working unchanged
+
 - Fix: `perform_async`, `perform_in` and `perform_at` of a raw worker with several queues (an Array, or a lambda that
   returns several) raise an `ArgumentError` that names the worker and its queues and asks for `queue:` when called
   without `queue:`
