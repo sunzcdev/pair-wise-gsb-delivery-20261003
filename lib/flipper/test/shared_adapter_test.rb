@@ -343,6 +343,30 @@ module Flipper
           refute @flipper[:stats].enabled?
         end
       end
+
+      def test_writes_do_not_change_gate_values_a_previous_read_returned
+        actor22 = Flipper::Actor.new('22')
+        actor_asdf = Flipper::Actor.new('asdf')
+
+        assert_equal true, @feature.enable(actor22)
+        assert_equal true, @adapter.enable(@feature, @actors_gate, Flipper::Types::PercentageOfActors.new(10))
+        before = @adapter.get(@feature)
+
+        assert_equal true, @feature.enable(actor_asdf)
+        assert_equal true, @adapter.enable(@feature, @actors_gate, Flipper::Types::PercentageOfActors.new(20))
+        assert_equal true, @feature.disable(actor22)
+
+        # The hash a reader already holds is one generation of the flags.
+        # Later writes must not leak into it, or a request memoizing it would
+        # see two generations mixed together.
+        assert_equal Set['22'], before[:actors]
+        assert_equal '10', before[:percentage_of_actors]
+
+        # New reads see the current values.
+        after = @adapter.get(@feature)
+        assert_equal Set['asdf'], after[:actors]
+        assert_equal '20', after[:percentage_of_actors]
+      end
     end
   end
 end
