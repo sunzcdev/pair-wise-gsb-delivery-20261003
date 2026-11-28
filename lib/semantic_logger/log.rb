@@ -356,9 +356,34 @@ module SemanticLogger
     # appender's formatter may ask for it. Nothing is cached while the exception has no backtrace:
     # one that was never raised can be given one later, as the Bugsnag appender does.
     def backtrace_of(exception, cleaner: nil)
-      return exception.backtrace unless cleaner && exception.backtrace
+      cleaner ? backtrace_frames_of(exception, cleaner: cleaner)&.map(&:text)&.freeze : exception.backtrace
+    end
 
-      cached([:backtrace, exception.__id__, cleaner.__id__]) { BacktraceCleaning.clean(exception.backtrace, cleaner) }
+    # Returns [Array<BacktraceCleaning::Frame>] the backtrace of the supplied exception as the
+    # cleaner cleans it, each frame with the indices, in the exception's own backtrace, of the
+    # original frames it stands for. nil when the exception has no backtrace.
+    #
+    # It is what #backtrace_of returns, with the source of each line: a line the cleaner moved, or
+    # rewrote, still says which original frame it came from, and a line it folded several original
+    # frames into says all of theirs (see BacktraceCleaning::Frame). A cleaner that responds to
+    # `#clean_frames` or `#call_frames` says this exactly; any other, such as
+    # `Rails.backtrace_cleaner`, can only be followed when a line it returns is the text of exactly
+    # one original frame, and a line it rewrote, or a text two original frames share, is marked as
+    # unknown rather than blamed on the wrong frame.
+    #
+    # Parameters
+    #   exception: [Exception]
+    #     This entry's exception, or one of its causes (see #each_exception).
+    #   cleaner: [Object|nil]
+    #     A backtrace cleaner (see #backtrace_of), which can also be one that cleans frames.
+    #     Default: nil (the exception's own backtrace, each frame with its own index)
+    #
+    # The frames are frozen, as are their lines and indices, and cached on this entry. The
+    # exception's own backtrace is left unchanged, so formatting the entry again returns the same
+    # frames.
+    def backtrace_frames_of(exception, cleaner: nil)
+      lines = exception.backtrace
+      lines && cached([:frames, exception.__id__, cleaner.__id__]) { BacktraceCleaning.clean_frames(lines, cleaner) }
     end
 
     # Returns [String] the exception backtrace including all of the child / caused by exceptions
@@ -436,9 +461,8 @@ module SemanticLogger
     # DEPRECATED
     def process_info(thread_name_length = 30)
       file, line = file_name_and_line(true)
-      file_name  = " #{file}:#{line}" if file
 
-      "#{$$}:#{format("%.#{thread_name_length}s", thread_name)}#{file_name}"
+      "#{$$}:#{format("%.#{thread_name_length}s", thread_name)}#{" #{file}:#{line}" if file}"
     end
 
     # Extract the file name and line number from the first line of the supplied backtrace.

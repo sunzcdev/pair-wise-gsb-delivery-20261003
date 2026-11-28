@@ -99,6 +99,9 @@ module SemanticLogger
       # names its class, without asking the class, such as `#<Class:0x000...>` for an anonymous class,
       # which has no name. Its message is read with Utils.exception_message, so that a #message
       # that raises, or does not return a String, cannot lose the entry.
+      #
+      # With the `backtrace_frames` option, `stack_trace_frames` writes, beside each line of the
+      # stack trace, the index of the original frame it came from (see Base#initialize).
       def exception
         return unless log.exception
 
@@ -108,8 +111,8 @@ module SemanticLogger
           name       = i.zero? ? :exception : :cause
           root[name] = {name: Utils.exception_name(exception), message: Utils.exception_message(exception)}
           details    = exception_details_for(exception)
-          root[name][:details]     = details if details
-          root[name][:stack_trace] = stack_trace_of(exception, cleaner)
+          root[name][:details] = details if details
+          add_stack_trace(root[name], exception, cleaner)
           root = root[name]
         end
       end
@@ -157,6 +160,33 @@ module SemanticLogger
       def stack_trace_of(exception, cleaner)
         backtrace = log.backtrace_of(exception, cleaner: cleaner)
         cleaner && backtrace ? backtrace.map(&:dup) : backtrace
+      end
+
+      # Writes the `stack_trace` of the exception's Hash, and with the `backtrace_frames` option,
+      # its `stack_trace_frames` too (see Base#initialize).
+      #
+      # `stack_trace_frames` holds each line of the stack trace with the original frame it came
+      # from: a line that folds several original frames into one has each of their indices under
+      # `:indices`, and a line whose original frame cannot be told, such as one a cleaner that only
+      # returns text rewrote, has neither. The Hashes are new, so a subclass can change them, as it
+      # can change the lines of the stack trace (see #stack_trace_of).
+      def add_stack_trace(exception_hash, exception, cleaner)
+        exception_hash[:stack_trace] = stack_trace_of(exception, cleaner)
+        return unless backtrace_frames
+
+        frames = log.backtrace_frames_of(exception, cleaner: cleaner)
+        exception_hash[:stack_trace_frames] = frames.map { |frame| stack_trace_frame(frame) } if frames
+      end
+
+      # Returns [Hash] the line of a cleaned frame, with the index of the original frame it came
+      # from, or the indices of the several it folds into its line (see #add_stack_trace).
+      def stack_trace_frame(frame)
+        line = {line: frame.text.dup}
+        return line if frame.unknown?
+
+        return line.merge(index: frame.indices.first) unless frame.collapsed?
+
+        line.merge(indices: frame.indices.dup)
       end
 
       # Returns [String] the lines of a stack trace, such as the Hash's `stack_trace`, as one text, one

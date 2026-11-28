@@ -311,6 +311,64 @@ Notes:
   it has a call site (see `call_site_level` above) or captured a backtrace (see `backtrace_level`
   above), and otherwise the first line of the exception's backtrace.
 
+#### Keeping the source of each frame
+
+A cleaner that leaves lines out, rewrites them, or reorders them loses the link between each line it
+writes and the frame of the exception's own backtrace it came from. Two frames can be written
+exactly alike, so the text alone cannot tell them apart. A cleaner can instead respond to
+`#clean_frames` (or `#call_frames`): it is given the original frames, and returns the frames to log.
+
+Each original frame is a `SemanticLogger::BacktraceCleaning::Frame`, with its `text` and the
+`indices` of the original frames it stands for: its own line in the exception's backtrace, starting at
+0. A frame the cleaner keeps keeps that index however it rewrites its text or wherever it moves it,
+and a line that folds several frames into one has each of their indices:
+
+~~~ruby
+class AppFrames
+  def clean_frames(frames)
+    app = frames.select { |frame| frame.text.include?("/app/") }
+    app.each_with_index.map { |frame, i| frame.with(text: "#{i}: #{frame.text}") }
+  end
+end
+
+SemanticLogger.backtrace_cleaner = AppFrames.new
+~~~
+
+`frame.with(text:, indices:)` returns a copy with the text or indices replaced, so when a cleaner
+folds two frames into one line it passes both indices, as in
+`frame.with(indices: first.indices + second.indices)`. A file name, line, and call site are never
+taken from a cleaned line, so the entry still points at the original call.
+
+A cleaner that only responds to `#clean` or `#call`, such as `Rails.backtrace_cleaner`, keeps
+working as before. Its lines can only be traced back when a line it returns is the text of exactly
+one original frame, such as one it left as it was. A line it rewrote, and a text that two or more
+original frames share, are marked as having no source rather than blamed on the wrong frame.
+
+The source is written only when the formatter is asked, with `backtrace_frames: true`. `:json`,
+`:fluentd`, `:logfmt`, and `:syslog_cee` then add a `stack_trace_frames` array beside each
+`stack_trace`, holding one Hash per line:
+
+~~~ruby
+SemanticLogger.add_appender(file_name: "production.json", formatter: {json: {backtrace_frames: true}})
+~~~
+
+~~~json
+"exception": {
+  "name": "RuntimeError",
+  "message": "Oh no",
+  "stack_trace": ["models/order.rb:12:in 'Order#ship'", "models/order.rb:42:in 'Order#submit'"],
+  "stack_trace_frames": [
+    {"line": "models/order.rb:12:in 'Order#ship'", "indices": [0, 3]},
+    {"line": "models/order.rb:42:in 'Order#submit'", "index": 1}
+  ]
+}
+~~~
+
+A line that folds several original frames into one has their indices under `indices`, and every
+other line has the index of its one original frame under `index`. A line whose source cannot be told
+has neither. The text formatters keep writing the cleaned lines, and ignore the option. Nothing is
+written unless the option is set, so no output changes until you ask for it.
+
 ### Redacting sensitive keys
 
 Name the keys whose values must never be logged, such as passwords and access tokens, and their

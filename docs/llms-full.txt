@@ -1180,6 +1180,64 @@ Notes:
   it has a call site (see `call_site_level` above) or captured a backtrace (see `backtrace_level`
   above), and otherwise the first line of the exception's backtrace.
 
+#### Keeping the source of each frame
+
+A cleaner that leaves lines out, rewrites them, or reorders them loses the link between each line it
+writes and the frame of the exception's own backtrace it came from. Two frames can be written
+exactly alike, so the text alone cannot tell them apart. A cleaner can instead respond to
+`#clean_frames` (or `#call_frames`): it is given the original frames, and returns the frames to log.
+
+Each original frame is a `SemanticLogger::BacktraceCleaning::Frame`, with its `text` and the
+`indices` of the original frames it stands for: its own line in the exception's backtrace, starting at
+0. A frame the cleaner keeps keeps that index however it rewrites its text or wherever it moves it,
+and a line that folds several frames into one has each of their indices:
+
+~~~ruby
+class AppFrames
+  def clean_frames(frames)
+    app = frames.select { |frame| frame.text.include?("/app/") }
+    app.each_with_index.map { |frame, i| frame.with(text: "#{i}: #{frame.text}") }
+  end
+end
+
+SemanticLogger.backtrace_cleaner = AppFrames.new
+~~~
+
+`frame.with(text:, indices:)` returns a copy with the text or indices replaced, so when a cleaner
+folds two frames into one line it passes both indices, as in
+`frame.with(indices: first.indices + second.indices)`. A file name, line, and call site are never
+taken from a cleaned line, so the entry still points at the original call.
+
+A cleaner that only responds to `#clean` or `#call`, such as `Rails.backtrace_cleaner`, keeps
+working as before. Its lines can only be traced back when a line it returns is the text of exactly
+one original frame, such as one it left as it was. A line it rewrote, and a text that two or more
+original frames share, are marked as having no source rather than blamed on the wrong frame.
+
+The source is written only when the formatter is asked, with `backtrace_frames: true`. `:json`,
+`:fluentd`, `:logfmt`, and `:syslog_cee` then add a `stack_trace_frames` array beside each
+`stack_trace`, holding one Hash per line:
+
+~~~ruby
+SemanticLogger.add_appender(file_name: "production.json", formatter: {json: {backtrace_frames: true}})
+~~~
+
+~~~json
+"exception": {
+  "name": "RuntimeError",
+  "message": "Oh no",
+  "stack_trace": ["models/order.rb:12:in 'Order#ship'", "models/order.rb:42:in 'Order#submit'"],
+  "stack_trace_frames": [
+    {"line": "models/order.rb:12:in 'Order#ship'", "indices": [0, 3]},
+    {"line": "models/order.rb:42:in 'Order#submit'", "index": 1}
+  ]
+}
+~~~
+
+A line that folds several original frames into one has their indices under `indices`, and every
+other line has the index of its one original frame under `index`. A line whose source cannot be told
+has neither. The text formatters keep writing the cleaned lines, and ignore the option. Nothing is
+written unless the option is set, so no output changes until you ask for it.
+
 ### Redacting sensitive keys
 
 Name the keys whose values must never be logged, such as passwords and access tokens, and their
@@ -2364,6 +2422,12 @@ Notes:
 * To also log the detail Ruby adds to an exception's message, such as did_you_mean suggestions, as
   `exception.details`, enable `log_exception_details`: `formatter: {json: {log_exception_details: true}}`.
   See [Exception details](config.html#exception-details).
+* To keep the source of each line when a [backtrace cleaner](config.html#cleaning-backtraces) leaves
+  lines out, rewrites them, or reorders them, enable `backtrace_frames`: `formatter: {json: {backtrace_frames: true}}`.
+  Each `stack_trace` then has a `stack_trace_frames` array too, with `{"line": ..., "index": n}` for a
+  line that came from one frame, or `{"line": ..., "indices": [n, m]}` for a line that folds several
+  original frames into one. See
+  [Keeping the source of each frame](config.html#keeping-the-source-of-each-frame).
 
 ### Fluentd
 
@@ -3693,7 +3757,8 @@ These read-only helpers derive convenient values from the attributes above:
 |`cleansed_message`|`String`|The message with Rails/ANSI color escape codes stripped. Used to keep terminal codes out of structured output.|
 |`each_exception`|Enumerator|Iterates the exception and its nested `cause` chain, yielding `(exception, depth)`.|
 |`backtrace_to_s(cleaner: nil)`|`String`|The exception backtrace as a string, including every exception in the `cause` chain. Lines are separated by a line break, with none before the first or after the last, so put your own line break before it. With a block, each cause's message and each backtrace line is replaced by the value the block returns, for example to escape it. With a `cleaner`, each backtrace is first cleaned as `backtrace_of` cleans it. Each cause is written as `Cause: Class: message`, with the class named as Ruby names it in `Exception#inspect`: the constant it was assigned to, even when the class overrides `self.name`, or for an anonymous class the class as Ruby writes it, such as `#<Class:0x000...>`. A cause's message, as written and as passed to the block, is always a `String`: when its `#message` raises, the message it was raised with is used instead, and a `nil` message is empty. Text in encodings that cannot be joined, such as a binary message and a UTF-8 backtrace line, is joined as UTF-8, and so are binary or US-ASCII backtrace lines that hold bytes outside ASCII, such as Ruby's own where no locale is set in a directory such as `café`, which would otherwise make the whole text binary or invalid US-ASCII.|
-|`backtrace_of(exception, cleaner: nil)`|`Array<String>` or `nil`|The backtrace of `exception` (this event's exception or one of its causes). With a [backtrace cleaner](config.html#cleaning-backtraces) object, such as `Rails.backtrace_cleaner` (not `true`, as the formatter option accepts), the lines it keeps, or the full backtrace when it keeps none; the exception is not changed. A cleaned backtrace, and each of its lines, is frozen and cached on the event.|
+|`backtrace_of(exception, cleaner: nil)`|`Array<String>` or `nil`|The backtrace of `exception` (this event's exception or one of its causes). With a [backtrace cleaner](config.html#cleaning-backtraces) object, such as `Rails.backtrace_cleaner` (not `true`, as the formatter option accepts), the lines it keeps, or the full backtrace when it keeps none; the exception is not changed. The cleaned frames are frozen and cached on the event, and the Array of their lines is a frozen copy.|
+|`backtrace_frames_of(exception, cleaner: nil)`|`Array<BacktraceCleaning::Frame>` or `nil`|The same backtrace, each line a frame that also holds the `indices` of the original frames it came from: one index for a line the cleaner kept, moved, or rewrote, several for a line it folded frames into, and none when the source cannot be told (see [Keeping the source of each frame](config.html#keeping-the-source-of-each-frame)). With a cleaner of its own that responds to `clean_frames` or `call_frames`, the source is exact; a cleaner that only returns text can only be followed when a line is the text of one original frame. Frozen and cached on the event; the exception is not changed.|
 |`exception_details(exception, source: false)`|`String` or `nil`|The detail Ruby's `Exception#detailed_message` adds to the message of `exception` (this event's exception or one of its causes), such as did_you_mean suggestions, without the class name. `source: true` also includes error_highlight's source snippet. `nil` when there is none. Cached on the event.|
 |`file_name_and_line(short_name = false)`|`[String, Integer]` or `nil`|The file name and line number from the event's call site, or else its backtrace or exception. Pass `true` for just the base file name.|
 |`to_h`|`Hash`|The event as a plain Hash (via the Raw formatter), including `host`, `application`, and `environment`. Handy for inspecting an event or building a custom formatter.|

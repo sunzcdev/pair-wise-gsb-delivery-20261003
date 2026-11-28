@@ -39,6 +39,19 @@ This project adheres to [Semantic Versioning](http://semver.org/).
   [Cleaning backtraces](https://logger.reidmorrison.com/config.html#cleaning-backtraces).
 - `Log#backtrace_of(exception, cleaner:)` returns an exception's backtrace as a cleaner cleans it,
   cached on the entry, and `Log#backtrace_to_s` accepts `cleaner:`, for custom formatters.
+- A backtrace cleaner can keep the source of each line it writes. One that responds to
+  `#clean_frames` (or `#call_frames`) is given the original frames, each a
+  `SemanticLogger::BacktraceCleaning::Frame` with its `text` and the `indices` of the original frames
+  it stands for, and returns the frames to log. A frame it keeps keeps its index however it rewrites
+  the text or moves the frame, and a line that folds several frames into one holds each of their
+  indices, even when two frames are written exactly alike. The structured formatters write them with
+  the new `backtrace_frames: true` formatter option, as a `stack_trace_frames` array beside each
+  `stack_trace`. A cleaner that only responds to `#clean` or `#call`, such as
+  `Rails.backtrace_cleaner`, keeps working, and a line whose source cannot then be told has no index.
+  `Log#backtrace_frames_of(exception, cleaner:)` exposes the frames to custom formatters. The entry's
+  call site, file name, and line number still come from the original call, and the exception's own
+  backtrace is never changed, so formatting the entry again is unchanged. See
+  [Keeping the source of each frame](https://logger.reidmorrison.com/config.html#keeping-the-source-of-each-frame).
 - `SemanticLogger.sensitive_keys=` names the keys, such as passwords and access tokens, whose values
   are replaced with `[FILTERED]` in every log entry before any appender writes it (discussion #272).
   It takes an Array of Symbols and Strings, which match any key whose name contains them, ignoring

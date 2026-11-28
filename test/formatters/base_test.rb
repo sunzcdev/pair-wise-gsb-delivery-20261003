@@ -59,6 +59,26 @@ module SemanticLogger
           it "builds the time format from the supplied precision" do
             assert_equal "%Y-%m-%d %H:%M:%S.%3N", SemanticLogger::Formatters::Base.new(precision: 3).time_format
           end
+
+          it "writes no backtrace frames by default" do
+            refute formatter.backtrace_frames
+          end
+
+          it "accepts backtrace_frames" do
+            assert SemanticLogger::Formatters::Base.new(backtrace_frames: true).backtrace_frames
+            refute SemanticLogger::Formatters::Base.new(backtrace_frames: false).backtrace_frames
+          end
+
+          it "treats any truthy backtrace_frames as true" do
+            assert SemanticLogger::Formatters::Base.new(backtrace_frames: :yes).backtrace_frames
+          end
+
+          it "can change backtrace_frames after the formatter was built" do
+            custom = SemanticLogger::Formatters::Base.new
+            custom.backtrace_frames = true
+
+            assert custom.backtrace_frames
+          end
         end
 
         describe "#pid" do

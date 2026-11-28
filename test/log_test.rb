@@ -1027,6 +1027,86 @@ module SemanticLogger
         end
       end
 
+      describe "#backtrace_frames_of" do
+        # Two original frames whose text is exactly alike, with the real call line between them.
+        # The call line is the first of a backtrace whose lines are only the exception's own, so the
+        # entry's file name and line number come from it (see #file_name_and_line).
+        let(:repeated) { "/app/models/order.rb:12:in 'Order#same'".freeze }
+        let(:call_line) { "/app/models/order.rb:42:in 'Order#ship'".freeze }
+        let(:lines) { [repeated, call_line, repeated] }
+
+        let(:frame_cleaner) do
+          Class.new do
+            def clean_frames(frames)
+              [frames[2].with(text: "moved", indices: [2]), frames[1], frames[0].with(text: "moved", indices: [0])]
+            end
+          end.new
+        end
+
+        before do
+          exception.set_backtrace(lines)
+          log.exception = exception
+        end
+
+        it "returns each original frame with its own index without a cleaner" do
+          frames = log.backtrace_frames_of(exception)
+
+          assert_equal lines, frames.map(&:text)
+          assert_equal [[0], [1], [2]], frames.map(&:indices)
+          assert_predicate frames, :frozen?
+        end
+
+        it "returns nil for an exception without a backtrace" do
+          assert_nil log.backtrace_frames_of(RuntimeError.new("Not raised"))
+          assert_nil log.backtrace_frames_of(RuntimeError.new("Not raised"), cleaner: frame_cleaner)
+        end
+
+        it "keeps the source of each frame that the cleaner moved and rewrote" do
+          frames = log.backtrace_frames_of(exception, cleaner: frame_cleaner)
+
+          assert_equal ["moved", call_line, "moved"], frames.map(&:text)
+          assert_equal [[2], [1], [0]], frames.map(&:indices)
+        end
+
+        it "returns the lines of #backtrace_of" do
+          assert_equal log.backtrace_of(exception, cleaner: frame_cleaner),
+                       log.backtrace_frames_of(exception, cleaner: frame_cleaner).map(&:text)
+        end
+
+        it "marks the frames a text cleaner rewrote as unknown" do
+          frames = log.backtrace_frames_of(exception, cleaner: ->(all) { [all[0].upcase, all[1]] })
+
+          assert_equal [[], [1]], frames.map(&:indices)
+        end
+
+        it "leaves the exception's own backtrace unchanged, even when formatted again" do
+          log.backtrace_frames_of(exception, cleaner: frame_cleaner)
+          log.backtrace_frames_of(exception, cleaner: frame_cleaner)
+
+          assert_equal lines, exception.backtrace
+        end
+
+        it "asks the cleaner once, however many formatters ask" do
+          calls   = 0
+          cleaner = Class.new do
+            define_method(:clean_frames) do |frames|
+              calls += 1
+              frames
+            end
+          end.new
+
+          2.times { log.backtrace_frames_of(exception, cleaner: cleaner) }
+
+          assert_equal 1, calls
+        end
+
+        it "keeps the result of each cleaner apart" do
+          log.backtrace_frames_of(exception, cleaner: frame_cleaner)
+
+          assert_equal [[1]], log.backtrace_frames_of(exception, cleaner: ->(frames) { [frames[1]] }).map(&:indices)
+        end
+      end
+
       describe "#exception_details" do
         # Supplies its own detail, the same way on every Ruby version.
         detailed_error = Class.new(StandardError) do

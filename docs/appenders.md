@@ -288,6 +288,12 @@ Notes:
 * To also log the detail Ruby adds to an exception's message, such as did_you_mean suggestions, as
   `exception.details`, enable `log_exception_details`: `formatter: {json: {log_exception_details: true}}`.
   See [Exception details](config.html#exception-details).
+* To keep the source of each line when a [backtrace cleaner](config.html#cleaning-backtraces) leaves
+  lines out, rewrites them, or reorders them, enable `backtrace_frames`: `formatter: {json: {backtrace_frames: true}}`.
+  Each `stack_trace` then has a `stack_trace_frames` array too, with `{"line": ..., "index": n}` for a
+  line that came from one frame, or `{"line": ..., "indices": [n, m]}` for a line that folds several
+  original frames into one. See
+  [Keeping the source of each frame](config.html#keeping-the-source-of-each-frame).
 
 ### Fluentd
 

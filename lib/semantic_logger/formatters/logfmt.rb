@@ -39,11 +39,12 @@ module SemanticLogger
       # name and message do not replace the entry's own.
       EXCEPTION_FIELDS = Utils.make_shareable(
         {
-          name:        "exception_name",
-          message:     "exception_message",
-          details:     "exception_details",
-          stack_trace: "stack_trace",
-          cause:       "cause"
+          name:               "exception_name",
+          message:            "exception_message",
+          details:            "exception_details",
+          stack_trace:        "stack_trace",
+          stack_trace_frames: "stack_trace_frames",
+          cause:              "cause"
         }.freeze
       )
 

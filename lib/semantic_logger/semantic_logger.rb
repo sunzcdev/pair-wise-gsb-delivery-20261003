@@ -144,6 +144,14 @@ module SemanticLogger
   #     such as a Proc. It is given each exception's backtrace as an Array of Strings, and returns
   #     the lines to log. When it leaves out every line, or raises, the full backtrace is logged,
   #     and an error it raises is reported to the internal logger.
+  #     It can also respond to `#clean_frames` or to `#call_frames`, in place of or beside #clean.
+  #     It is then given the original frames, each with the index of its line in the exception's
+  #     backtrace, and returns the frames to log, so that it can say which original frame it kept,
+  #     moved, rewrote, or folded into a line with another, even when two frames are written
+  #     exactly alike (see BacktraceCleaning::Frame). With the `backtrace_frames` formatter option,
+  #     those indices are written beside the lines. A cleaner that only returns text keeps the
+  #     source of a line only when that line is the text of exactly one original frame, and its
+  #     other lines are marked as having no source.
   #     It is called on the appender threads, so it must be thread safe.
   #     nil: Do not clean backtraces.
   #     Default: nil

@@ -201,6 +201,143 @@ module SemanticLogger
 
           assert_equal [GEM_FRAME, APP_FRAME, GEM_FRAME], exception.backtrace
         end
+
+        describe "backtrace_frames" do
+          # Two frames whose text is exactly alike, with the real call line between them.
+          let(:repeated) { "/app/models/order.rb:12:in 'Order#same'".freeze }
+          let(:call_line) { "/app/models/order.rb:42:in 'Order#ship'".freeze }
+          let(:cleaned_frames) { [repeated, call_line, repeated] }
+
+          # Swaps the two repeated frames, rewrites their text, and in a second pass folds them into
+          # one, keeping every original index. The text alone cannot tell which frame is which.
+          let(:frame_cleaner) do
+            Class.new do
+              def clean_frames(frames)
+                [
+                  frames[2].with(text: "moved", indices: [2]),
+                  frames[1],
+                  frames[0].with(text: "moved", indices: [0])
+                ]
+              end
+            end.new
+          end
+
+          let(:folding_cleaner) do
+            Class.new do
+              def clean_frames(frames)
+                [frames[2].with(text: "folded", indices: frames[2].indices + frames[0].indices), frames[1]]
+              end
+            end.new
+          end
+
+          before do
+            exception.set_backtrace(cleaned_frames)
+            SemanticLogger.backtrace_cleaner = nil
+          end
+
+          # The cleaned frames as the structured formatter writes them, before JSON serialization.
+          def raw_frames(formatter)
+            formatter.call(log, logger)[:exception][:stack_trace_frames]
+          end
+
+          it "writes the index of each original frame a cleaner moved" do
+            frames = raw_frames(Raw.new(backtrace_cleaner: frame_cleaner, backtrace_frames: true))
+
+            assert_equal [{line: "moved", index: 2}, {line: call_line, index: 1}, {line: "moved", index: 0}], frames
+          end
+
+          it "writes every original index a cleaner folded into one line" do
+            formatter = Raw.new(backtrace_cleaner: folding_cleaner, backtrace_frames: true)
+            frames    = raw_frames(formatter)
+
+            assert_equal [{line: "folded", indices: [0, 2]}, {line: call_line, index: 1}], frames
+            assert_equal ["folded", call_line],
+                         Raw.new(backtrace_cleaner: folding_cleaner).call(log, logger)[:exception][:stack_trace]
+          end
+
+          it "writes the frames as JSON too, keeping the source of each line" do
+            parsed = JSON.parse(Json.new(backtrace_cleaner: frame_cleaner, backtrace_frames: true).call(log, logger))
+
+            assert_equal [{"line" => "moved", "index" => 2}, {"line" => call_line, "index" => 1},
+                          {"line" => "moved", "index" => 0}],
+                         parsed["exception"]["stack_trace_frames"]
+            assert_equal ["moved", call_line, "moved"], parsed["exception"]["stack_trace"]
+          end
+
+          it "keeps the same source on every format of the same entry, and the original backtrace" do
+            formatter = Raw.new(backtrace_cleaner: frame_cleaner, backtrace_frames: true)
+
+            assert_equal raw_frames(formatter), raw_frames(formatter)
+            assert_equal cleaned_frames, exception.backtrace
+          end
+
+          it "keeps the call site of the entry, which is the original call line" do
+            log.call_site = SemanticLogger::CallSite.parse(call_line)
+
+            formatter = Raw.new(backtrace_cleaner: frame_cleaner, backtrace_frames: true)
+            formatter.call(log, logger)
+
+            assert_equal call_line, log.call_site.to_s
+            assert_equal ["/app/models/order.rb", 42], log.call_site.file_name_and_line
+          end
+
+          it "marks the frames a cleaner that only returns text rewrote as having no source" do
+            frames = raw_frames(Raw.new(backtrace_cleaner: ->(lines) { [lines[0], lines[1]] }, backtrace_frames: true))
+
+            assert_equal [{line: repeated}, {line: call_line, index: 1}], frames
+          end
+
+          it "writes no frames by default" do
+            refute Raw.new(backtrace_cleaner: frame_cleaner).call(log, logger)[:exception].key?(:stack_trace_frames)
+            refute JSON.parse(Json.new(backtrace_cleaner: frame_cleaner).call(log, logger))["exception"].
+              key?("stack_trace_frames")
+          end
+
+          it "accepts true and false" do
+            assert Raw.new(backtrace_frames: true).call(log, logger)[:exception].key?(:stack_trace_frames)
+            refute Raw.new(backtrace_frames: false).call(log, logger)[:exception].key?(:stack_trace_frames)
+          end
+
+          it "writes the frames of each exception that caused the logged one" do
+            begin
+              begin
+                raise ArgumentError, "inner"
+              rescue ArgumentError => e
+                e.set_backtrace([GEM_FRAME, "/app/models/line_item.rb:3:in 'LineItem#save'"])
+                raise "outer"
+              end
+            rescue RuntimeError => e
+              e.set_backtrace([GEM_FRAME, APP_FRAME])
+              log.exception = e
+            end
+
+            cause = Raw.new(backtrace_cleaner: true, backtrace_frames: true).call(log, logger)[:exception][:cause]
+
+            assert_equal [{line: GEM_FRAME, index: 0},
+                          {line: "/app/models/line_item.rb:3:in 'LineItem#save'", index: 1}],
+                         cause[:stack_trace_frames]
+          end
+
+          it "writes the frames of the original backtrace when there is no cleaner" do
+            frames = raw_frames(Raw.new(backtrace_frames: true))
+
+            assert_equal [{line: repeated, index: 0}, {line: call_line, index: 1}, {line: repeated, index: 2}], frames
+          end
+
+          it "gives each formatter a copy of the frames that it can change" do
+            formatter = Raw.new(backtrace_cleaner: frame_cleaner, backtrace_frames: true)
+            frames    = raw_frames(formatter)
+            frames.first[:line] << " edited"
+            frames << {line: "added"}
+
+            assert_equal 3, raw_frames(formatter).length
+            assert_equal "moved", raw_frames(formatter).first[:line]
+          end
+
+          it "writes the text formatters' output without the frames" do
+            assert_includes output(Default.new(backtrace_cleaner: frame_cleaner, backtrace_frames: true)), "moved"
+          end
+        end
       end
     end
   end

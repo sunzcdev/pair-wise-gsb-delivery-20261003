@@ -93,6 +93,17 @@ module SemanticLogger
       #     SemanticLogger.backtrace_cleaner=).
       #     Default: true for the text formatters (Default and those built on it) and the Json
       #     formatters, false otherwise.
+      #   backtrace_frames: [true|false]
+      #     Write, beside the lines of each cleaned backtrace, the original frames they came from:
+      #     for the structured formatters built on Raw, a `stack_trace_frames` array of
+      #     `{line:, index:}` Hashes, or `{line:, indices: [...]}` for a line that folds several
+      #     original frames into one, in the order the lines are written (see
+      #     BacktraceCleaning::Frame). A line whose original frame cannot be told, such as one a
+      #     cleaner that only returns text rewrote, has no index. The exception's own backtrace is
+      #     never changed, so the entry's call site, file name, and line number are still those of
+      #     the original call.
+      #     The text formatters write the cleaned lines as before, and ignore this option.
+      #     Default: false
       def initialize(time_format: nil,
                      log_host: true,
                      log_application: true,
@@ -100,7 +111,8 @@ module SemanticLogger
                      precision: PRECISION,
                      escape_control_chars: false,
                      log_exception_details: default_log_exception_details,
-                     backtrace_cleaner: default_backtrace_cleaner)
+                     backtrace_cleaner: default_backtrace_cleaner,
+                     backtrace_frames: false)
         self.time_format      = time_format || self.class.build_time_format(precision)
         @log_host             = log_host
         @log_application      = log_application
@@ -108,6 +120,7 @@ module SemanticLogger
         @precision            = precision
         @escape_control_chars  = escape_control_chars
         @log_exception_details = log_exception_details
+        @backtrace_frames      = backtrace_frames ? true : false
         self.backtrace_cleaner = backtrace_cleaner
       end
 
@@ -125,6 +138,14 @@ module SemanticLogger
 
       # Returns [true|false|Object] the `backtrace_cleaner` option. See #initialize.
       attr_reader :backtrace_cleaner
+
+      # Returns [true|false] the `backtrace_frames` option. See #initialize.
+      attr_reader :backtrace_frames
+
+      # Sets the `backtrace_frames` option. See #initialize.
+      def backtrace_frames=(backtrace_frames)
+        @backtrace_frames = backtrace_frames ? true : false
+      end
 
       # Sets the `backtrace_cleaner` option. See #initialize.
       # Raises ArgumentError for any other value, so that a mistake surfaces here rather than on
