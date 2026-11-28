@@ -19,6 +19,8 @@ from watchdog.events import (
     DirMovedEvent,
     EventsLostEvent,
     FileAttribEvent,
+    FileCreatedEvent,
+    FileDeletedEvent,
     FileMovedEvent,
     FileSystemEventHandler,
 )
@@ -35,7 +37,12 @@ if TYPE_CHECKING:
     from typing import Self
 
 from watchdog.observers import winapi
-from watchdog.observers.read_directory_changes import WindowsApiEmitter, WindowsApiObserver
+from watchdog.observers.read_directory_changes import (
+    ManifestDiff,
+    ManifestRecovery,
+    WindowsApiEmitter,
+    WindowsApiObserver,
+)
 from watchdog.observers.winapi import (
     FILE_ACTION_CREATED,
     FILE_ACTION_DELETED,
@@ -629,3 +636,173 @@ def test_generate_observed_path_deleted_event():
     buf_standard = _generate_observed_path_deleted_event(extended=False)
     events_standard = _parse_event_buffer(buf_standard)
     assert events_standard == [(FILE_ACTION_DELETED_SELF, ".")]
+
+
+class ScriptedReader:
+    """A reader replaying a fixed script of native-event batches."""
+
+    def __init__(self, batches):
+        self.batches = list(batches)
+
+    def get_events(self, timeout):
+        return self.batches.pop(0) if self.batches else []
+
+    def stop(self):
+        pass
+
+
+def _drain(event_queue):
+    events = []
+    while True:
+        try:
+            event, _ = event_queue.get_nowait()
+        except Empty:
+            return events
+        events.append(event)
+
+
+def test_manifest_recovery_rebuilds_trusted_manifest_after_overflows():
+    """A subscriber replays the confirmed diff and later events to its final manifest.
+
+    From files a and b: the rename old half of a is read, then the buffer
+    overflows. The first scan (b deleted, c added, a renamed to a2) is
+    invalidated by a late rename new half and a second overflow; a scan
+    failing with access denied confirms nothing either. Only the scan with no
+    intervening loss delivers the diff against the last trusted manifest, and
+    the ordinary event for d, created afterwards, applies on top of it.
+    """
+    watched = mkdtemp()
+    a = os.path.join(watched, "a")
+    b = os.path.join(watched, "b")
+    a2 = os.path.join(watched, "a2")
+    c = os.path.join(watched, "c")
+    d = os.path.join(watched, "d")
+
+    recovery = ManifestRecovery({a, b})
+    event_queue = Queue()
+    emitter = WindowsApiEmitter(
+        event_queue,
+        ObservedWatch(watched, recursive=False),
+        timeout=0.05,
+        recovery=recovery,
+    )
+    emitter._reader = ScriptedReader(  # noqa: SLF001
+        [
+            [WinAPINativeEvent(FILE_ACTION_RENAMED_OLD_NAME, "a"), WinAPINativeEvent(FILE_ACTION_OVERFLOW, ".")],
+            [WinAPINativeEvent(FILE_ACTION_RENAMED_NEW_NAME, "a2"), WinAPINativeEvent(FILE_ACTION_OVERFLOW, ".")],
+            [WinAPINativeEvent(FILE_ACTION_CREATED, "d")],
+        ]
+    )
+
+    # The rename old half of a, then an overflow: {a, b} stays the last trusted manifest.
+    emitter.queue_events(0)
+    assert recovery.trusted_manifest == {a, b}
+    assert recovery.uncertain
+    assert recovery.unconfirmed_coverage == (0, 1)
+
+    # First scan sees b deleted, c added and a renamed to a2, but a late rename
+    # new half and a second overflow land while it runs: it confirms nothing.
+    token = recovery.begin_scan()
+    emitter.queue_events(0)
+    assert recovery.finish_scan(token, {a2, c}) is None
+    assert recovery.trusted_manifest == {a, b}
+    assert recovery.uncertain
+    assert recovery.unconfirmed_coverage == (0, 2)
+
+    # The stale rename old half must not pair with the late new half.
+    queued = _drain(event_queue)
+    assert queued.count(EventsLostEvent(watched, is_directory=True)) == 2
+    assert FileMovedEvent(a, a2) not in queued
+
+    # A scan that fails, e.g. with access denied, leaves the coverage unconfirmed.
+    token = recovery.begin_scan()
+    recovery.abort_scan(token)
+    assert recovery.uncertain
+    assert recovery.trusted_manifest == {a, b}
+
+    # A scan with no intervening loss confirms against the last trusted manifest.
+    token = recovery.begin_scan()
+    diff = recovery.finish_scan(token, {a2, c})
+    assert diff == ManifestDiff(created=frozenset({a2, c}), deleted=frozenset({a, b}))
+    assert not recovery.uncertain
+    assert recovery.unconfirmed_coverage == (2, 2)
+    assert recovery.trusted_manifest == {a2, c}
+
+    # d is created after the recovery: its ordinary event applies on top.
+    emitter.queue_events(0)
+    assert recovery.trusted_manifest == {a2, c, d}
+
+    # Replaying the delivered diff and the ordinary events rebuilds the final manifest.
+    manifest = {a, b}
+    manifest -= diff.deleted
+    manifest |= diff.created
+    for event in _drain(event_queue):
+        if isinstance(event, FileCreatedEvent):
+            manifest.add(event.src_path)
+    assert manifest == {a2, c, d}
+
+
+def test_overflow_keeps_pending_rename_half_when_recovery_disabled():
+    """Without a recovery, an overflow does not touch the rename pairing state."""
+    watched = mkdtemp()
+    a = os.path.join(watched, "a")
+    a2 = os.path.join(watched, "a2")
+    event_queue = Queue()
+    emitter = WindowsApiEmitter(event_queue, ObservedWatch(watched, recursive=False), timeout=0.05)
+    emitter._reader = ScriptedReader(  # noqa: SLF001
+        [
+            [WinAPINativeEvent(FILE_ACTION_RENAMED_OLD_NAME, "a"), WinAPINativeEvent(FILE_ACTION_OVERFLOW, ".")],
+            [WinAPINativeEvent(FILE_ACTION_RENAMED_NEW_NAME, "a2")],
+        ]
+    )
+
+    emitter.queue_events(0)
+    emitter.queue_events(0)
+
+    assert FileMovedEvent(a, a2) in _drain(event_queue)
+
+
+def test_manifest_recovery_tracks_losses_filtered_out_of_the_queue():
+    """Event filtering is unchanged, and the recovery sees losses the filter hides."""
+    watched = mkdtemp()
+    recovery = ManifestRecovery()
+    event_queue = Queue()
+    emitter = WindowsApiEmitter(
+        event_queue,
+        ObservedWatch(watched, recursive=False),
+        timeout=0.05,
+        event_filter=[FileCreatedEvent],
+        recovery=recovery,
+    )
+    emitter._reader = ScriptedReader([[WinAPINativeEvent(FILE_ACTION_OVERFLOW, ".")]])  # noqa: SLF001
+
+    emitter.queue_events(0)
+
+    assert event_queue.empty()  # EventsLostEvent is filtered out, as without a recovery
+    assert recovery.uncertain
+    assert recovery.unconfirmed_coverage == (0, 1)
+
+
+def test_manifest_recovery_applies_normal_events_while_certain():
+    recovery = ManifestRecovery({"/watched/a"})
+    assert not recovery.uncertain
+
+    recovery.note_event(FileCreatedEvent("/watched/b"))
+    recovery.note_event(FileMovedEvent("/watched/a", "/watched/a2"))
+    recovery.note_event(FileDeletedEvent("/watched/b"))
+
+    assert recovery.trusted_manifest == {"/watched/a2"}
+
+
+def test_manifest_recovery_ignores_events_until_a_scan_confirms():
+    recovery = ManifestRecovery({"/watched/a"})
+
+    recovery.note_event(EventsLostEvent("/watched", is_directory=True))
+    recovery.note_event(FileCreatedEvent("/watched/b"))
+    assert recovery.trusted_manifest == {"/watched/a"}
+
+    diff = recovery.finish_scan(recovery.begin_scan(), {"/watched/a", "/watched/b"})
+    assert diff == ManifestDiff(created=frozenset({"/watched/b"}), deleted=frozenset())
+
+    recovery.note_event(FileCreatedEvent("/watched/c"))
+    assert recovery.trusted_manifest == {"/watched/a", "/watched/b", "/watched/c"}

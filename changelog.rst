@@ -33,6 +33,7 @@ Changelog
 - [inotify] Stop watching directories moved out of a watched tree and emit synthetic deletion/moved events for their subdirectories. (`#354 <https://github.com/gorakhargosh/watchdog/issues/354>`__, thanks to @prateek-dagar)
 - [inotify] Events read before a kernel queue overflow are delivered instead of discarded, ahead of the ``EventsLostEvent``. (`#1440 <https://github.com/gorakhargosh/watchdog/issues/1440>`__, thanks to @KurathSec and @fstrasz)
 - [windows] Report lost events: when the ``ReadDirectoryChangesW`` buffer of a watch overflows, the watch gets an ``EventsLostEvent``, dispatched to ``FileSystemEventHandler.on_events_lost()``, as on inotify. (`#1440 <https://github.com/gorakhargosh/watchdog/issues/1440>`__, thanks to @fstrasz)
+- [windows] Add ``ManifestRecovery``, an optional recovery entry point for subscribers that maintain a path manifest. Passed to ``WindowsApiEmitter``, it tracks the last trusted manifest and the not yet confirmable coverage interval across ``EventsLostEvent`` losses, and confirms a directory scan as a ``ManifestDiff`` against the last trusted manifest; scans spanning another loss or failing (e.g. access denied) confirm nothing. With a recovery in place, a rename half pending across an overflow no longer pairs with a late one.
 
 7.1.0
 ~~~~~
